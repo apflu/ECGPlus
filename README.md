@@ -1,4 +1,4 @@
-<img width="2244" height="1050" alt="image" src="https://github.com/user-attachments/assets/0ce3d2c0-b201-4c61-8c9b-6b946a1a78b3" />
+<img width="2341" height="1041" alt="image" src="https://github.com/user-attachments/assets/fdf28b46-baed-46e1-9345-edf67786f1b6" />
 
 
 Reworks the ECG on the health chip so it looks closer to a real monitor. Align to most identifiable vanilla threshold, so vanilla experience remains valid.

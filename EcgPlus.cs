@@ -9,7 +9,7 @@ namespace EcgPlus
 {
     // Display-only ECG rework. Gameplay values (heart rate, BP, fibrillation, defib odds) are untouched;
     // only what Body.GetECGHeight returns to the ECG screen changes, plus two text fixes.
-    [BepInPlugin("local.cu.ecgplus", "CU ECG Plus", "1.0.0")]
+    [BepInPlugin("local.cu.ecgplus", "CU ECG Plus", "1.0.1")]
     public class Plugin : BaseUnityPlugin
     {
         internal static ConfigEntry<bool> on, fixST, staging, jWave, lowVoltage, textFixes;
@@ -106,7 +106,8 @@ namespace EcgPlus
             public int kind;
             public float pr, qrs, qt, j;
             public bool thumped;
-            public float per, fib;   // ventricular: cycle length and fibrillation when generated
+            public float per, fib;
+            public bool tail;   // ventricular beat followed by a normal beat: no upswing into a next complex   // ventricular: cycle length and fibrillation when generated
         }
 
         static readonly List<Beat> beats = new List<Beat>();
@@ -282,6 +283,9 @@ namespace EcgPlus
                     double sn = sinusNext;
                     while (sn + 0.16 < T + 0.42) sn += rr;
                     nextKind = Normal; nextT = sn;
+                    var lastV = beats[beats.Count - 1];
+                    lastV.tail = true;
+                    beats[beats.Count - 1] = lastV;
                 }
                 // the rate may have changed while scheduling: stretch this beat to meet the next one exactly,
                 // otherwise the triangle/sine wave gets a gap or a double-up at every seam
@@ -318,6 +322,10 @@ namespace EcgPlus
                 // Phase-aligned with the template (peak at 50 ms) so blending doesn't cancel amplitude.
                 float x = s / bt.per;
                 float sn = x < 1f ? Mathf.Sin(2f * Mathf.PI * (x + 0.25f - 0.05f / bt.per)) : 0f;
+                // the wave climbs again after its trough to meet the next ventricular complex; on the last one of a
+                // run (or a lone PVC) ease from the trough back to baseline instead
+                float xTrough = 0.5f + 0.05f / bt.per;
+                if (bt.tail && x > xTrough && x < 1f) sn = -(1f - Smooth(xTrough, 1f, x));
                 float tri = x < 1f ? Mathf.Asin(sn) * (2f / Mathf.PI) : 0f;
                 float periodic = 0.9f * Mathf.Lerp(tri, sn, Smooth(71f, 77f, bt.fib));
                 return Mathf.Lerp(tmpl, periodic, Mathf.Pow(Mathf.Clamp01((bt.fib - 36f) / 29f), 0.8f));

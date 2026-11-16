@@ -1,3 +1,6 @@
+<img width="2341" height="1041" alt="image" src="https://github.com/user-attachments/assets/fdf28b46-baed-46e1-9345-edf67786f1b6" />
+
+
 Reworks the ECG on the health chip so it looks closer to a real monitor. Align to most identifiable vanilla threshold, so vanilla experience remains valid.
 
 Since 1.1.0 it also has two optional gameplay parts: a rework of defib shocks during cardiac arrest (on by default, can be turned off in the config) and a Long QT syndrome challenge (a run setting, off by default).

@@ -178,7 +178,8 @@ namespace EcgPlus
                 if (Rhythm.SineWeight(f) >= 0.5f) return Ui.L("V-flutter");
                 return Ui.L(Rhythm.TriWeight(f) >= 0.5f ? "VT (triangle)" : "VT");
             }
-            return Ui.L(f > 15f ? "Sinus + ectopy" : "Sinus");
+            string lqt = LongQt.Dominant();
+            return Ui.L(f > 15f ? "Sinus w/ PVCs" : "Sinus") + (lqt.Length > 0 ? " · " + lqt : "");
         }
 
         static string SegName(Body b, List<Rhythm.Beat> bs)
@@ -353,7 +354,7 @@ namespace EcgPlus
             ["VF (coarse)"] = "粗颤",
             ["VF (fine)"] = "细颤",
             ["Sinus"] = "窦性心律",
-            ["Sinus + ectopy"] = "窦性心律 + 异位搏动",
+            ["Sinus w/ PVCs"] = "窦性心律伴室早",
             ["Asystole"] = "心脏停搏",
             ["V-flutter > VF"] = "室扑转室颤",
         };

@@ -7,9 +7,10 @@ using UnityEngine;
 
 namespace EcgPlus
 {
-    // Display-only ECG rework. Gameplay values (heart rate, BP, fibrillation, defib odds) are untouched;
-    // only what Body.GetECGHeight returns to the ECG screen changes, plus two text fixes.
-    [BepInPlugin("local.cu.ecgplus", "CU ECG Plus", "1.0.1")]
+    // ECG rework: what Body.GetECGHeight returns to the ECG screen, the big "ecgview" monitor, the manual
+    // defib screen, and text fixes. Gameplay changes are limited to the arrest shock rework (EcgArrest.cs,
+    // config toggle) and the opt-in long QT challenge run setting (EcgLongQt.cs).
+    [BepInPlugin("local.cu.ecgplus", "CU ECG Plus", "1.1.0")]
     public class Plugin : BaseUnityPlugin
     {
         internal static ConfigEntry<bool> on, fixST, staging, jWave, lowVoltage, textFixes, arrestShock;
@@ -23,6 +24,8 @@ namespace EcgPlus
             lowVoltage = Config.Bind("Waveform", "HemothoraxLowVoltage", true, "Smaller complexes with hemothorax.");
             textFixes = Config.Bind("Text", "Fixes", true, "Chinese text fixes: 心率不齐 -> 心律不齐, fibrillation3 -> 室扑, cardiac arrest description");
             arrestShock = Config.Bind("Gameplay", "ArrestShockRework", true, "Shocks in cardiac arrest restart the heart 90% of the time while VF is coarse, falling to 30% as it decays to fine VF (vanilla: 20%). Most restarts keep fibrillation at 60-80 and can slide back into arrest. Clean restarts stay at 20%, same as vanilla.");
+            LongQt.Bind(Config);
+            LongQt.Register();
             new Harmony("local.cu.ecgplus").PatchAll(typeof(Plugin).Assembly);
             Logger.LogInfo("ECG Plus loaded");
         }
@@ -84,12 +87,15 @@ namespace EcgPlus
     static class CirculationPatch
     {
         static readonly AccessTools.FieldRef<Body, bool> didThump = AccessTools.FieldRefAccess<Body, bool>("didThump");
-        static void Prefix(Body __instance)
+        static void Prefix(Body __instance, out (float fib, bool rising) __state)
         {
+            __state = (__instance.fibrillationProgress, __instance.fibrillationRising);
             if (Plugin.on.Value && IsPlayer(__instance)) didThump(__instance) = true;
         }
-        static void Postfix(Body __instance)
+        static void Postfix(Body __instance, (float fib, bool rising) __state)
         {
+            // gameplay (long QT challenge) runs whatever monitor is shown
+            if (IsPlayer(__instance)) try { LongQt.Tick(__instance, __state.fib, __state.rising); } catch (Exception) { }
             if (!Plugin.on.Value || !IsPlayer(__instance)) return;
             try { Rhythm.Tick(__instance); } catch (Exception) { }
         }
@@ -120,6 +126,11 @@ namespace EcgPlus
                 EcgView.Toggle();
             }, new Dictionary<int, List<string>> { { 0, new List<string> { "mark" } }, { 1, new List<string> { "waves", "types", "all", "off" } }, { 2, new List<string> { "force" } } },
                ("mark", "optional: mark"), ("what", "waves / types / all / off"), ("force", "optional: also label above 150 bpm")));
+            ConsoleScript.Commands.Add(new Command("lqt", "Long QT challenge: shows the fibrillation rise per subtype. lqt <key> <value> tunes a rate (saved to the config).", delegate (string[] args)
+            {
+                Traverse.Create(ConsoleScript.instance).Method("LogToConsole", new[] { typeof(string) }).GetValue(LongQt.Command(args));
+            }, new Dictionary<int, List<string>> { { 0, new List<string> { "Overall", "Lqt1Max", "Lqt1WaterMult", "Lqt3Sleep", "Lqt3Rest", "Lqt3Brady", "Lqt2Max", "ColdPerDegree", "QtProlong" } } },
+               ("key", "optional: rate to change"), ("value", "new value")));
         }
     }
 
@@ -489,7 +500,7 @@ namespace EcgPlus
                 rr *= 1f - rsaAmp * Mathf.Sin(2f * Mathf.PI * respPhase);   // shorter RR while breathing in
                 float temp = b.temperature;
                 bool cold = Plugin.jWave.Value;
-                float qtFactor = cold ? 1f + 0.035f * Mathf.Max(0f, 35f - temp) : 1f;
+                float qtFactor = (cold ? 1f + 0.035f * Mathf.Max(0f, 35f - temp) : 1f) * LongQt.QtFactor;
                 beat.pr = 0.16f;
                 beat.qrs = 0.09f;
                 beat.qt = 0.40f * Mathf.Sqrt(rr) * qtFactor;          // Bazett, QTc 400 ms

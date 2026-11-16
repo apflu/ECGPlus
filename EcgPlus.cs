@@ -25,6 +25,12 @@ namespace EcgPlus
             new Harmony("local.cu.ecgplus").PatchAll(typeof(Plugin).Assembly);
             Logger.LogInfo("ECG Plus loaded");
         }
+
+        void Update()
+        {
+            try { EcgView.Tick(); } catch (Exception e) { Logger.LogError(e); }
+            try { DefibScreenPatch.Watch(); } catch (Exception e) { Logger.LogError(e); }
+        }
     }
 
     [HarmonyPatch(typeof(Body), nameof(Body.GetECGHeight))]
@@ -33,12 +39,20 @@ namespace EcgPlus
         static void Postfix(Body __instance, float offset, ref float __result)
         {
             if (!Plugin.on.Value) return;
-            try { __result = Rhythm.Eval(__instance, offset, __result); }
+            // vanilla ECGVisualizer maps the value straight to a pixel row; anything outside -1..1 indexes out of the texture
+            try { __result = Mathf.Clamp(Rhythm.Eval(__instance, offset, __result), -1f, 1f); }
             catch (Exception) { /* fall back to vanilla value */ }
         }
     }
 
     // Heartbeat sound follows the displayed beats: vanilla thump is suppressed, ours plays at each R wave.
+    [HarmonyPatch(typeof(ECGVisualizer), "Update")]
+    static class VisualizerPatch
+    {
+        static void Prefix(ECGVisualizer __instance) { Rhythm.currentVis = __instance; }
+        static void Postfix() { Rhythm.currentVis = null; }
+    }
+
     [HarmonyPatch(typeof(Body), nameof(Body.HandleCirculation))]
     static class CirculationPatch
     {
@@ -68,6 +82,17 @@ namespace EcgPlus
                 Traverse.Create(ConsoleScript.instance).Method("LogToConsole", new[] { typeof(string) })
                     .GetValue("ECG: " + (Plugin.on.Value ? "EcgPlus" : "vanilla"));
             }, new Dictionary<int, List<string>> { { 0, new List<string> { "plus", "vanilla" } } }, ("mode", "plus / vanilla; empty = toggle")));
+            ConsoleScript.Commands.Add(new Command("ecgview", "Opens or closes a large ECG monitor (Esc also closes). ecgview mark waves|types|all|off [force] labels PQRST/J and beat types (below 150 bpm unless forced).", delegate (string[] args)
+            {
+                if (args.Length >= 3 && args[1] == "mark")
+                {
+                    string msg = EcgView.SetMarks(args[2], args.Length >= 4 && args[3] == "force");
+                    Traverse.Create(ConsoleScript.instance).Method("LogToConsole", new[] { typeof(string) }).GetValue(msg);
+                    return;
+                }
+                EcgView.Toggle();
+            }, new Dictionary<int, List<string>> { { 0, new List<string> { "mark" } }, { 1, new List<string> { "waves", "types", "all", "off" } }, { 2, new List<string> { "force" } } },
+               ("mark", "optional: mark"), ("what", "waves / types / all / off"), ("force", "optional: also label above 150 bpm")));
         }
     }
 
@@ -100,14 +125,17 @@ namespace EcgPlus
     {
         const int Normal = 0, Ventricular = 1;
 
-        struct Beat
+        internal struct Beat
         {
             public double t0;          // P onset (normal) or QRS onset (ventricular), unscaled seconds
             public int kind;
             public float pr, qrs, qt, j;
             public bool thumped;
-            public float per, fib;
-            public bool tail;   // ventricular beat followed by a normal beat: no upswing into a next complex   // ventricular: cycle length and fibrillation when generated
+            public float per, fib;   // ventricular: cycle length and fibrillation when generated
+            public bool tail;   // ventricular beat followed by a normal beat: no upswing into a next complex
+            public int run;     // ventricular: id of the run this beat belongs to (single PVC = run of 1)
+            public bool sus;    // ventricular: scheduled as sustained VT rather than a counted run
+            public float amp0, amp1;   // ventricular: amplitude at the start / end of this cycle (flutter degrading, fib 80-95)
         }
 
         static readonly List<Beat> beats = new List<Beat>();
@@ -116,6 +144,10 @@ namespace EcgPlus
         static float arrestBrain = 100f;
         static int nextKind, runLeft;
         static float vtRR = 0.33f;
+        static int runCounter, curRun;
+        static float lastAmp = 1f;
+        static bool curSus;
+        internal static List<Beat> Beats => beats;
         static Body lastBody;
 
         public static float Eval(Body b, float offset, float vanilla)
@@ -137,14 +169,27 @@ namespace EcgPlus
                 if (v < mn) mn = v;
             }
             float best = end;
+            float lastOut = 0f;
+            if (currentVis != null) lastOuts.TryGetValue(currentVis, out lastOut);
             float up = mx - Mathf.Max(lastOut, end), down = Mathf.Min(lastOut, end) - mn;
             if (up > 0.02f && up >= down) best = mx;
             else if (down > 0.02f) best = mn;
-            lastOut = best;
+            if (currentVis != null) lastOuts[currentVis] = best;
             return best;
         }
 
-        static float lastOut;
+        // several monitors sample at once (health panel, unconscious overlay, defib minigame): keep the
+        // peak-sampler memory per monitor, set by the ECGVisualizer.Update prefix
+        internal static object currentVis;
+        static readonly Dictionary<object, float> lastOuts = new Dictionary<object, float>();
+
+        // continuous sample for the big view (fine time steps, no peak sampler needed)
+        internal static float Sample(Body b, float offset)
+        {
+            if (b.defibShockedFrames > 0) return (float)(rng.NextDouble() * 2.0 - 1.0);
+            if (!b.alive || b != lastBody) return 0f;
+            return Raw(b, offset, 0f);
+        }
 
         static float Raw(Body b, float offset, float vanilla)
         {
@@ -163,6 +208,7 @@ namespace EcgPlus
                 float amp = Mathf.Lerp(0.12f, 0.7f, left);
                 return VF(t) * amp * lv;
             }
+            Schedule(b, now);
             float beatsSig = 0f;
             for (int i = 0; i < beats.Count; i++) beatsSig += Wave(beats[i], (float)(t - beats[i].t0), b);
 
@@ -196,12 +242,7 @@ namespace EcgPlus
             arrestStart = -1;
             if (b.defibShockedFrames > 0 && nextT < now + 0.5) nextT = now + 0.5;
 
-            float f = Plugin.staging.Value ? b.fibrillationProgress : Mathf.Min(b.fibrillationProgress, 14f);
-            while (nextT <= now)
-            {
-                AddBeat(nextT, nextKind, b, f, b.heartRate);
-                if (nextT < now - 2.0) nextT = now;
-            }
+            Schedule(b, now);
             // thump when a beat's R wave passes
             for (int i = 0; i < beats.Count; i++)
             {
@@ -215,11 +256,25 @@ namespace EcgPlus
             }
         }
 
+        // Generate every beat that starts by "now". Also called from the samplers: a monitor may draw before
+        // HandleCirculation runs this frame, and sampling past the last scheduled beat drew a dip to baseline
+        // right before the next complex.
+        static void Schedule(Body b, double now)
+        {
+            if (b != lastBody || !b.alive || b.inCardiacArrest) return;
+            float f = Plugin.staging.Value ? b.fibrillationProgress : Mathf.Min(b.fibrillationProgress, 14f);
+            while (nextT <= now)
+            {
+                AddBeat(nextT, nextKind, b, f, b.heartRate);
+                if (nextT < now - 2.0) nextT = now;
+            }
+        }
+
         // same clip/volume rules as vanilla Body.HandleCirculation
         static void Thump(Body b)
         {
             var cam = PlayerCamera.main;
-            bool monitor = cam.woundView.activeSelf;
+            bool monitor = cam.woundView.activeSelf || EcgView.IsOpen || (DefibScreenPatch.monitor != null && DefibScreenPatch.monitor.Alive);
             if (!monitor && !b.isCriticallyDying) return;
             string clip = "heartthump";
             if (b.isCriticallyDying)
@@ -255,7 +310,18 @@ namespace EcgPlus
                 if (need > rr) { float k = rr / need; beat.pr *= k; beat.qt *= k; beat.qrs = Mathf.Min(beat.qrs, beat.qt * 0.3f); }
                 beat.j = cold ? 0.6f * Mathf.Clamp01((33f - temp) / 8f) : 0f;   // Osborn wave: from 33C, 0.3 of R at 29C, 0.6 at 25C
             }
-            if (kind == Ventricular) { beat.per = vtRR; beat.fib = f; }
+            if (kind == Ventricular)
+            {
+                beat.per = vtRR; beat.fib = f; beat.run = curRun; beat.sus = curSus;
+                // flutter degrading toward VF: beat-to-beat size varies more and more (+-0 at 80 .. +-30% at 95),
+                // ramped across the cycle so the seams stay continuous
+                // 95-100: the flutter itself breaks up (+-30% -> +-80%) while VF blends in
+                float irr = Mathf.InverseLerp(80f, 95f, f), brk = Smooth(95f, 100f, f);
+                beat.amp0 = lastAmp;
+                beat.amp1 = Mathf.Max(0.15f, 1f + ((float)rng.NextDouble() * 2f - 1f) * (0.3f * irr + 0.5f * brk));
+                lastAmp = beat.amp1;
+            }
+            else lastAmp = 1f;
             beats.Add(beat);
             if (beats.Count > 6) beats.RemoveAt(0);
 
@@ -267,15 +333,16 @@ namespace EcgPlus
             if (kind == Normal)
             {
                 sinusNext = T + rr;   // the sinus node keeps its own clock through ectopy
-                if (r < pSus) { SetVtRate(hr); nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
-                else if (r < pSus + pRun) { SetVtRate(hr); runLeft = RunExtraBeats(f); nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
-                else if (r < pSus + pRun + pPvc) { runLeft = 0; nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
+                if (r < pSus) { SetVtRate(hr); curRun = ++runCounter; curSus = true; nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
+                else if (r < pSus + pRun) { SetVtRate(hr); curRun = ++runCounter; curSus = false; runLeft = RunExtraBeats(f); nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
+                else if (r < pSus + pRun + pPvc) { runLeft = 0; curRun = ++runCounter; curSus = false; nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
                 else { nextKind = Normal; nextT = sinusNext; }
             }
             else
             {
-                if (runLeft > 0) { runLeft--; SetVtRate(hr); nextKind = Ventricular; nextT = T + vtRR; }
-                else if (r < pSus) { SetVtRate(hr); nextKind = Ventricular; nextT = T + vtRR; }
+                float jit = 1f + ((float)rng.NextDouble() * 2f - 1f) * (0.1f * Mathf.InverseLerp(80f, 95f, f) + 0.3f * Smooth(95f, 100f, f));   // +-10% at 95, +-40% at 100
+                if (runLeft > 0) { runLeft--; SetVtRate(hr); nextKind = Ventricular; nextT = T + vtRR * jit; }
+                else if (r < pSus) { SetVtRate(hr); curSus = true; nextKind = Ventricular; nextT = T + vtRR * jit; }
                 else
                 {
                     // first sinus P whose QRS falls outside the ventricular refractory period conducts;
@@ -328,7 +395,8 @@ namespace EcgPlus
                 if (bt.tail && x > xTrough && x < 1f) sn = -(1f - Smooth(xTrough, 1f, x));
                 float tri = x < 1f ? Mathf.Asin(sn) * (2f / Mathf.PI) : 0f;
                 float periodic = 0.9f * Mathf.Lerp(tri, sn, Smooth(71f, 77f, bt.fib));
-                return Mathf.Lerp(tmpl, periodic, Mathf.Pow(Mathf.Clamp01((bt.fib - 36f) / 29f), 0.8f));
+                float ampV = Mathf.Lerp(bt.amp0, bt.amp1, Mathf.Clamp01(x));
+                return Mathf.Lerp(tmpl, periodic, Mathf.Pow(Mathf.Clamp01((bt.fib - 36f) / 29f), 0.8f)) * ampV;
             }
             float pr = bt.pr, qrs = bt.qrs, qt = bt.qt;
             if (s > pr + qt + 0.1f) return 0f;
@@ -363,6 +431,37 @@ namespace EcgPlus
                     + 0.35f * Mathf.Sin(2f * Mathf.PI * 6.1f * x + 2.3f * Mathf.Sin(0.53f * x + 1f))
                     + 0.25f * Mathf.Sin(2f * Mathf.PI * 7.7f * x + 1.1f * Mathf.Sin(1.37f * x + 2f));
             return v * (0.55f + 0.45f * Mathf.PerlinNoise(x * 0.7f, 0.3f));
+        }
+
+        // ---- info for the big view's annotations ----
+        internal static float TriWeight(float fib) => Mathf.Pow(Mathf.Clamp01((fib - 36f) / 29f), 0.8f);
+        internal static float SineWeight(float fib) => Smooth(71f, 77f, fib);
+        internal static float VfWeight(float fib) => Smooth(95f, 100f, fib);
+        internal static float ArrestAmp(Body b) => Mathf.Lerp(0.12f, 0.7f, arrestBrain > 0f ? Mathf.Clamp01(b.brainHealth / arrestBrain) : 0f);
+
+        // times (seconds after t0) of the labelled waves; below = trough (label goes under the trace)
+        internal static void Features(Beat bt, List<(string name, float dt, bool below)> o)
+        {
+            o.Clear();
+            if (bt.kind == Normal)
+            {
+                float pr = bt.pr, qrs = bt.qrs, qt = bt.qt;
+                o.Add(("P", pr * 0.356f, false));
+                o.Add(("Q", pr, true));
+                o.Add(("R", pr + 0.45f * qrs, false));
+                o.Add(("S", pr + 0.72f * qrs, true));
+                if (bt.j >= 0.1f) o.Add(("J", pr + qrs + 0.03f, false));
+                o.Add(("T", pr + qrs + 0.427f * (qt - qrs), false));
+            }
+            else
+            {
+                o.Add(("R", 0.05f, false));
+                if (TriWeight(bt.fib) < 0.5f)
+                {
+                    o.Add(("S", 0.125f, true));
+                    o.Add(("T", 0.3f, true));   // inverted
+                }
+            }
         }
 
         static float G(float x, float mu, float sig) { float z = (x - mu) / sig; return Mathf.Exp(-0.5f * z * z); }

@@ -7,11 +7,11 @@ Since 1.1.0 it also has two optional gameplay parts: a rework of defib shocks du
 - Most vanilla behaviour like Heartbeat sound etc. still synced to the trace
 - Hypothermia: J waves (or Osborn if you like) will appear below 33C body temp and longer Q-T period
 - Hemothorax: smaller complexes (lower voltage/amplitude)
-- (1.1.0) Sinus beat closer to lead II: deeper Q, S about half of R, flat ST
-- (1.1.0) PVCs look like real ones: wide and blunt, taller than sinus beats, with a deep inverted T (slow down, quick return). The blocked sinus P wave can show up as a small notch on the T
-- (1.1.0) Artifacts: footsteps, landing from a jump, swinging/digging (muscle noise), getting hit, shivering when cold
-- (1.1.0) Breathing slightly speeds up and slows down the heart rate at rest and in sleep (respiratory sinus arrhythmia)
-- (1.1.0) Heartbeat sound follows pulse strength: an early beat is weak or silent, the beat after the pause is louder
+- (1.1.0) Sinus beat closer to realistic lead II
+- (1.1.0) PVCs looks more realistic
+- (1.1.0) Artifacts(ECG noises): footsteps, movement/attack/mining, getting hit, shivering when cold
+- (1.1.0) Breathing slightly affect ECG (respiratory sinus arrhythmia)
+- (1.1.0) Heartbeat sound follows pulse strength
 
 - Arrhythmia still follow the fibrillation value in stages:
 ### 15+
@@ -40,9 +40,7 @@ heart fails, VF that goes from coarse VF to fine VF as the brain fails, flatline
 - Fix minor typo in zhCN
 
 ## Big monitor (1.1.0)
-- `ecgview` opens a large ECG monitor (Esc closes)
-- `ecgview mark waves|types|all|off` labels P/Q/R/S/T/J waves and beat types (N, PVC, couplet, NSVT, VT). Add `force` to keep labels above 150 bpm
-- The manual defibrillator screen uses the same monitor, with a MARK button to toggle the labels
+- The manual defibrillator screen uses a bigger monitor, with a MARK button to automatically label
 
 ## Defib shocks in cardiac arrest (1.1.0, config `ArrestShockRework`)
 Vanilla: a shock in cardiac arrest restarts the heart 20% of the time.

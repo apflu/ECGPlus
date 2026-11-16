@@ -12,7 +12,7 @@ namespace EcgPlus
     [BepInPlugin("local.cu.ecgplus", "CU ECG Plus", "1.0.1")]
     public class Plugin : BaseUnityPlugin
     {
-        internal static ConfigEntry<bool> on, fixST, staging, jWave, lowVoltage, textFixes;
+        internal static ConfigEntry<bool> on, fixST, staging, jWave, lowVoltage, textFixes, arrestShock;
 
         void Awake()
         {
@@ -22,6 +22,7 @@ namespace EcgPlus
             jWave = Config.Bind("Waveform", "Hypothermia", true, "J (Osborn) wave and QT prolongation when cold.");
             lowVoltage = Config.Bind("Waveform", "HemothoraxLowVoltage", true, "Smaller complexes with hemothorax.");
             textFixes = Config.Bind("Text", "Fixes", true, "Chinese text fixes: 心率不齐 -> 心律不齐, fibrillation3 -> 室扑, cardiac arrest description");
+            arrestShock = Config.Bind("Gameplay", "ArrestShockRework", true, "Shocks in cardiac arrest restart the heart 90% of the time while VF is coarse, falling to 30% as it decays to fine VF (vanilla: 20%). Most restarts keep fibrillation at 60-80 and can slide back into arrest. Clean restarts stay at 20%, same as vanilla.");
             new Harmony("local.cu.ecgplus").PatchAll(typeof(Plugin).Assembly);
             Logger.LogInfo("ECG Plus loaded");
         }
@@ -491,7 +492,9 @@ namespace EcgPlus
         internal static float TriWeight(float fib) => Mathf.Pow(Mathf.Clamp01((fib - 36f) / 29f), 0.8f);
         internal static float SineWeight(float fib) => Smooth(71f, 77f, fib);
         internal static float VfWeight(float fib) => Smooth(95f, 100f, fib);
-        internal static float ArrestAmp(Body b) => Mathf.Lerp(0.12f, 0.7f, arrestBrain > 0f ? Mathf.Clamp01(b.brainHealth / arrestBrain) : 0f);
+        // 1 = coarse VF right after the arrest began .. 0 = fine VF (brain lost since the arrest)
+        internal static float ArrestLeft(Body b) => arrestBrain > 0f ? Mathf.Clamp01(b.brainHealth / arrestBrain) : 0f;
+        internal static float ArrestAmp(Body b) => Mathf.Lerp(0.12f, 0.7f, ArrestLeft(b));
 
         // times (seconds after t0) of the labelled waves; below = trough (label goes under the trace)
         internal static void Features(Beat bt, List<(string name, float dt, bool below)> o)

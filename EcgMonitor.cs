@@ -32,6 +32,7 @@ namespace EcgPlus
         const double SegEvery = 1.5;
         double lastSeg, lastSeenT0, lastSeenP;
         readonly List<Mark> marks = new List<Mark>();
+        static readonly List<Mark> waveTmp = new List<Mark>();
         readonly Stack<TextMeshProUGUI> pool = new Stack<TextMeshProUGUI>();
         readonly Dictionary<int, Mark> runMark = new Dictionary<int, Mark>();
         readonly Dictionary<int, int> runLen = new Dictionary<int, int>();
@@ -138,6 +139,9 @@ namespace EcgPlus
             pool.Push(m.ui);
             m.ui = null;
         }
+
+        // rendered width of a short label; the pixel font's glyphs can be wider than TMP's estimate
+        float LabelWidth(TextMeshProUGUI t) => Mathf.Max(t.preferredWidth, labelSize * 0.75f * Mathf.Max(1, t.text.Length));
 
         TextMeshProUGUI NewLabel()
         {
@@ -292,6 +296,26 @@ namespace EcgPlus
                 m.ui.color = c4;
                 m.ui.enabled = true;
             }
+
+            // overlapping wave labels (Q and S sit only ~55 ms apart): push each pair apart sideways
+            waveTmp.Clear();
+            foreach (var m in marks)
+                if (!m.isType && m.ui != null && m.ui.enabled && lastT >= m.t) waveTmp.Add(m);
+            waveTmp.Sort((p, q) => p.t.CompareTo(q.t));
+            // compare every pair close in time, not just neighbours: Q and S have the R label between them
+            for (int i = 0; i < waveTmp.Count; i++)
+                for (int j = i + 1; j < waveTmp.Count && waveTmp[j].t - waveTmp[i].t < 0.3; j++)
+                {
+                    var ra = (RectTransform)waveTmp[i].ui.transform;
+                    var rb = (RectTransform)waveTmp[j].ui.transform;
+                    Vector2 pa = ra.anchoredPosition, pb = rb.anchoredPosition;
+                    float need = (LabelWidth(waveTmp[i].ui) + LabelWidth(waveTmp[j].ui)) * 0.5f + 2f;
+                    float dx = pb.x - pa.x;   // newer label is to the right (negative = wrapped around the sweep)
+                    if (dx < 0f || dx >= need || Mathf.Abs(pb.y - pa.y) >= labelSize * 0.9f) continue;
+                    float push = (need - dx) * 0.5f;
+                    ra.anchoredPosition = new Vector2(pa.x - push, pa.y);
+                    rb.anchoredPosition = new Vector2(pb.x + push, pb.y);
+                }
 
             // colliding type labels: a run label (PVC / couplet / NSVT ...) wins over a "normal" one
             for (int i = 0; i < marks.Count; i++)

@@ -22,6 +22,7 @@
     <Reference Include="Unity.TextMeshPro"><HintPath>$(Managed)\Unity.TextMeshPro.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(Managed)\UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(Managed)\UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.Physics2DModule"><HintPath>$(Managed)\UnityEngine.Physics2DModule.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
   <Target Name="Deploy" AfterTargets="Build" Condition="'$(Configuration)'=='Release'">
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\BepInEx\plugins\EcgPlus" />

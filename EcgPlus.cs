@@ -54,6 +54,32 @@ namespace EcgPlus
         static void Postfix() { Rhythm.currentVis = null; }
     }
 
+    // every footstep (animation event) jolts the electrodes: one impulse on the trace
+    [HarmonyPatch(typeof(Body), nameof(Body.FootStep))]
+    static class FootStepPatch
+    {
+        static void Postfix(Body __instance)
+        {
+            if (!Plugin.on.Value || !(PlayerCamera.main != null && PlayerCamera.main.body == __instance)) return;
+            try { Rhythm.Step(__instance); } catch (Exception) { }
+        }
+    }
+
+    // swinging / striking: the chest electrodes sit on the pectoral muscles -> a burst of muscle (EMG) noise
+    [HarmonyPatch(typeof(Body), nameof(Body.Attack))]
+    static class AttackPatch
+    {
+        // vanilla returns true only when the swing hits something; a swing at thin air returns false.
+        // A swing happened when the cooldown was ready before and is running after.
+        static void Prefix(Body __instance, out bool __state) => __state = __instance.attackCooldown <= 0f;
+        static void Postfix(Body __instance, AttackInfo atk, bool __state)
+        {
+            if (!__state || __instance.attackCooldown <= 0f) return;
+            if (!Plugin.on.Value || !(PlayerCamera.main != null && PlayerCamera.main.body == __instance)) return;
+            try { Rhythm.Swing(atk); } catch (Exception) { }
+        }
+    }
+
     [HarmonyPatch(typeof(Body), nameof(Body.HandleCirculation))]
     static class CirculationPatch
     {
@@ -217,7 +243,7 @@ namespace EcgPlus
                 // independent of timescale/run settings, and it's always fine VF by the time the brain dies
                 float left = arrestBrain > 0f ? Mathf.Clamp01(b.brainHealth / arrestBrain) : 0f;
                 float amp = Mathf.Lerp(0.12f, 0.7f, left);
-                return VF(t) * amp * lv;
+                return Fit(VF(t) * amp * lv + Artifact(t));
             }
             Schedule(b, now);
             float beatsSig = 0f;
@@ -232,13 +258,122 @@ namespace EcgPlus
             {
                 // vanilla arrhythmia blend on top of the corrected sinus beat
                 float mix = b.fibrillationProgress / 90f;
-                return Mathf.Lerp(beatsSig * lv, vanilla, Mathf.Clamp01(mix));
+                return Fit(Mathf.Lerp(beatsSig * lv, vanilla, Mathf.Clamp01(mix)) + Artifact(t));
             }
 
             // VT turns into flutter by itself; VF blends in over 95-100, then the arrest branch above takes over
             float wVf = Smooth(95f, 100f, f);
             float sig = Mathf.Lerp(beatsSig, VF(t) * 0.75f, wVf);
-            return sig * lv;
+            return Fit(sig * lv + Artifact(t));
+        }
+
+        // Keep the trace on screen: the monitors show |v| up to ~1.18 (0.85 scale). Artifacts riding on an
+        // R wave used to push it past the edge and flatten its tip. Above 0.95 compress smoothly toward 1.15,
+        // so peaks stay pointed (sinus R ~1.0 is barely touched, the taller PVC still stands out).
+        static float Fit(float v)
+        {
+            float a = Mathf.Abs(v);
+            if (a <= 0.95f) return v;
+            return Mathf.Sign(v) * (0.95f + 0.2f * Tanh((a - 0.95f) / 0.2f));
+        }
+
+        static float Tanh(float x) { float e = Mathf.Exp(2f * x); return (e - 1f) / (e + 1f); }
+
+        // ---- artifacts (not from the heart): electrode/muscle noise picked up by the leads ----
+        // Intensities are updated once per frame in Tick and eased, so every monitor draws the same smooth noise.
+        static float motionAmp, shiverAmp;
+
+        // step / landing impulses: skin and electrode jolted at foot strike
+        struct Jolt { public double t0; public float amp; }
+        static readonly List<Jolt> jolts = new List<Jolt>();
+        static int stepSide = 1;
+        static float lastVy;
+        static bool wasGrounded = true;
+
+        internal static void Step(Body b)
+        {
+            float vx = b.rb != null ? Mathf.Abs(b.rb.velocity.x) : 0f;
+            stepSide = -stepSide;   // left / right foot pull the leads a little differently
+            float amp = (0.12f + 0.18f * Mathf.Clamp01((vx - 2f) / 6f)) * (stepSide > 0 ? 1f : 0.7f);
+            AddJolt(amp * (0.85f + 0.3f * (float)rng.NextDouble()));
+        }
+
+        // muscle bursts from arm work (attacks, digging, chopping), plus jolts when getting hit
+        struct Burst { public double t0; public float amp, dur; }
+        static readonly List<Burst> bursts = new List<Burst>();
+        static float lastPain = -1f;
+
+        internal static void Swing(AttackInfo atk)
+        {
+            // heavier, slower swings (longer cooldown) tense more muscle for longer; guns (no physical swing) only kick
+            float cd = Mathf.Clamp(atk.cooldown, 0.2f, 2f);
+            if (atk.physicalSwing)
+            {
+                bursts.Add(new Burst { t0 = Time.unscaledTime, amp = 0.12f + 0.12f * Mathf.InverseLerp(0.2f, 1.5f, cd), dur = 0.25f + 0.25f * cd });
+                if (bursts.Count > 6) bursts.RemoveAt(0);
+            }
+            AddJolt(atk.physicalSwing ? 0.15f : 0.2f);
+        }
+
+        static void AddJolt(float amp)
+        {
+            jolts.Add(new Jolt { t0 = Time.unscaledTime, amp = amp });
+            if (jolts.Count > 8) jolts.RemoveAt(0);
+        }
+
+        static void UpdateArtifacts(Body b, float dt)
+        {
+            // motion: running/falling, climbing, working out -> baseline wander + muscle (EMG) fuzz (steps add their own jolts)
+            float speed = b.rb != null ? b.rb.velocity.magnitude : 0f;
+            // landing: a jolt scaled by how hard the body hit the ground
+            if (b.grounded && !wasGrounded && lastVy < -6f) AddJolt(Mathf.Min(0.6f, 0.04f * (-lastVy)));
+            wasGrounded = b.grounded;
+            // getting hit: a sudden rise in pain jolts the leads
+            if (lastPain >= 0f && b.averagePain - lastPain > 4f && b.defibShockedFrames <= 0)
+                AddJolt(Mathf.Min(0.5f, 0.15f + 0.02f * (b.averagePain - lastPain)));
+            lastPain = b.averagePain;
+            lastVy = b.rb != null ? b.rb.velocity.y : 0f;
+            float m = 0.15f * Mathf.Clamp01(speed / 6f) + ((bool)b.currentClimbable ? 0.15f : 0f) + (b.exercising ? 0.25f : 0f);
+            motionAmp = Mathf.MoveTowards(motionAmp, Mathf.Min(m, 0.45f), dt * 1.5f);
+            // shivering: from ~35.5 C down to ~32 C, then the body stops shivering (and only while conscious)
+            float T = b.temperature;
+            float s = b.conscious ? (1f - Smooth(34.4f, 35.6f, T)) * Smooth(31.5f, 32.5f, T) : 0f;
+            shiverAmp = Mathf.MoveTowards(shiverAmp, s, dt * 0.5f);
+        }
+
+        static float Artifact(double t)
+        {
+            float v = 0f;
+            for (int i = 0; i < jolts.Count; i++)
+            {
+                float s = (float)(t - jolts[i].t0);
+                // sharp deflection at heel strike, then a slower rebound
+                if (s > 0f && s < 0.4f) v += jolts[i].amp * (G(s, 0.035f, 0.018f) - 0.45f * G(s, 0.13f, 0.05f));
+            }
+            float x = (float)(t % 1000.0);
+            for (int i = 0; i < bursts.Count; i++)
+            {
+                float s = (float)(t - bursts[i].t0), d = bursts[i].dur;
+                if (s <= 0f || s > d) continue;
+                float env = Smooth(0f, 0.04f, s) * (1f - Smooth(d * 0.4f, d, s));
+                v += bursts[i].amp * env * (Mathf.PerlinNoise(x * 45f, 9.7f) - 0.5f) * 2f;
+            }
+            if (motionAmp < 0.005f && shiverAmp < 0.005f) return v;
+            if (motionAmp >= 0.005f)
+            {
+                float wander = (Mathf.PerlinNoise(x * 0.9f, 1.7f) - 0.5f) * 1.6f;          // slow baseline drift
+                float emg = (Mathf.PerlinNoise(x * 35f, 4.1f) - 0.5f) * 0.7f;               // muscle fuzz
+                v += motionAmp * (wander + emg);
+            }
+            if (shiverAmp >= 0.005f)
+            {
+                // fine irregular 8-14 Hz tremor, waxing and waning
+                float tremor = Mathf.Sin(2f * Mathf.PI * 9.1f * x + 2f * Mathf.Sin(1.3f * x))
+                             + 0.7f * Mathf.Sin(2f * Mathf.PI * 12.7f * x + 1.5f * Mathf.Sin(0.7f * x + 1f));
+                float swell = 0.4f + 0.6f * Mathf.PerlinNoise(x * 1.1f, 7.3f);
+                v += shiverAmp * 0.055f * tremor * swell;
+            }
+            return v;
         }
 
         // called once per frame from Body.HandleCirculation (player only)
@@ -246,7 +381,10 @@ namespace EcgPlus
         {
             double now = Time.unscaledTime;
             if (b != lastBody || now < lastNow || now - lastNow > 2.0) Reset(b, now);
+            float dt = (float)(now - lastNow);
             lastNow = now;
+            UpdateArtifacts(b, dt);
+            UpdateBreathing(b, dt);
 
             if (!b.alive || b.inCardiacArrest)
             {
@@ -269,7 +407,9 @@ namespace EcgPlus
                 if (now < rT) continue;
                 bt.thumped = true;
                 beats[i] = bt;
-                if (now - rT < 0.25) Thump(b);   // vanilla also thumps at any rate
+                float strength = BeatStrength(bt, rT);
+                lastR = rT;
+                if (now - rT < 0.25 && strength > 0.2f) Thump(b, strength);   // vanilla also thumps at any rate
             }
         }
 
@@ -288,7 +428,20 @@ namespace EcgPlus
         }
 
         // same clip/volume rules as vanilla Body.HandleCirculation
-        static void Thump(Body b)
+        // Pulse strength from filling time (Frank-Starling): a premature beat ejects little blood (pulse deficit,
+        // its thump is faint or missing); the beat after the compensatory pause fills longer and hits harder.
+        static double lastR = -1;
+        static float BeatStrength(Beat bt, double rT)
+        {
+            if (lastR < 0) return 1f;
+            float c = (float)(rT - lastR) / Mathf.Max(sinusRR, 0.2f);
+            float s = c < 1f ? Mathf.Lerp(0.1f, 1f, Smooth(0.4f, 0.95f, c)) : 1f + 0.4f * Smooth(1.1f, 1.8f, c);
+            // sustained VT keeps a steady (weak) beat like vanilla instead of going silent
+            if (bt.kind == Ventricular && bt.sus) s = Mathf.Max(s, 0.5f);
+            return s;
+        }
+
+        static void Thump(Body b, float strength)
         {
             var cam = PlayerCamera.main;
             bool monitor = cam.woundView.activeSelf || EcgView.IsOpen || (DefibScreenPatch.monitor != null && DefibScreenPatch.monitor.Alive);
@@ -296,7 +449,7 @@ namespace EcgPlus
             string clip = "heartthump";
             if (b.isCriticallyDying)
                 clip = monitor && !WorldGeneration.unchipped ? "heartthump-heavy-monitor" : "heartthump-heavy";
-            float volume = 1f - (b.fibrillationProgress - 50f) / 80f;
+            float volume = (1f - (b.fibrillationProgress - 50f) / 80f) * strength;
             Sound.Play(clip, Vector2.zero, twoDimensional: true, pitchShift: false, null, volume, 1f, noReverb: true, ignoreMixer: true);
         }
 
@@ -310,6 +463,21 @@ namespace EcgPlus
             runLeft = 0;
             lastNow = now;
             arrestStart = -1;
+            lastR = -1;
+        }
+
+        // Respiratory sinus arrhythmia: the sinus rate speeds up on inspiration and slows on expiration.
+        // Strong at rest and in sleep, fades at high heart rates; gone when not breathing, unconscious
+        // (other than sleep) or critically ill - a rigid, metronome rhythm is itself a bad sign.
+        static float respPhase, rsaAmp;
+        static void UpdateBreathing(Body b, float dt)
+        {
+            float bpm = Mathf.Max(4f, b.respiratoryRate * 0.25f);   // same breaths/min as the game's readout
+            respPhase = (respPhase + dt * bpm / 60f) % 1f;
+            float a = 0.06f * Mathf.Clamp01((120f - b.heartRate) / 50f);
+            if (!b.breathing || b.isCriticallyDying || (!b.conscious && !b.sleeping)) a = 0f;
+            else if (b.sleeping) a *= 1.3f;
+            rsaAmp = Mathf.MoveTowards(rsaAmp, a, dt * 0.02f);
         }
 
         static void AddBeat(double T, int kind, Body b, float f, float hr)
@@ -318,6 +486,7 @@ namespace EcgPlus
             var beat = new Beat { t0 = T, kind = kind };
             if (kind == Normal)
             {
+                rr *= 1f - rsaAmp * Mathf.Sin(2f * Mathf.PI * respPhase);   // shorter RR while breathing in
                 float temp = b.temperature;
                 bool cold = Plugin.jWave.Value;
                 float qtFactor = cold ? 1f + 0.035f * Mathf.Max(0f, 35f - temp) : 1f;

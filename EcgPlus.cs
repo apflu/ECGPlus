@@ -17,7 +17,7 @@ namespace EcgPlus
         void Awake()
         {
             on = Config.Bind("General", "Enabled", true, "Use the reworked ECG waveform.");
-            fixST = Config.Bind("Waveform", "FixSTSegment", true, "Lift the vanilla depressed ST segment back to baseline.");
+            fixST = Config.Bind("Waveform", "FixSTSegment", true, "Corrected sinus beat (flat ST, lead II proportions) instead of the vanilla curve.");
             staging = Config.Bind("Waveform", "ArrhythmiaStaging", true, "PVCs -> runs of VT -> sustained VT -> flutter -> VF instead of the vanilla blend.");
             jWave = Config.Bind("Waveform", "Hypothermia", true, "J (Osborn) wave and QT prolongation when cold.");
             lowVoltage = Config.Bind("Waveform", "HemothoraxLowVoltage", true, "Smaller complexes with hemothorax.");
@@ -148,6 +148,14 @@ namespace EcgPlus
         static float lastAmp = 1f;
         static bool curSus;
         internal static List<Beat> Beats => beats;
+
+        // Sinus P waves that keep firing on the sinus clock while the ventricles are busy (blocked by a PVC's
+        // refractory period, or dissociated during a run): drawn on their own, landing on the PVC's ST/T as a notch.
+        internal struct PWave { public double t0; public float amp; }
+        static readonly List<PWave> buriedP = new List<PWave>();
+        internal static List<PWave> BuriedP => buriedP;
+        internal const float PPeak = 0.057f;   // P peak after P onset (same as the sinus beat's P at PR 160 ms)
+        static float sinusRR = 0.857f;
         static Body lastBody;
 
         public static float Eval(Body b, float offset, float vanilla)
@@ -175,7 +183,9 @@ namespace EcgPlus
             if (up > 0.02f && up >= down) best = mx;
             else if (down > 0.02f) best = mn;
             if (currentVis != null) lastOuts[currentVis] = best;
-            return best;
+            // the vanilla monitor maps -1..1 to the full texture height, so sinus R already touches the top row;
+            // shrink a little so the taller PVC (~1.15) isn't clipped (same 0.85 as the big view)
+            return best * 0.85f;
         }
 
         // several monitors sample at once (health panel, unconscious overlay, defib minigame): keep the
@@ -211,6 +221,11 @@ namespace EcgPlus
             Schedule(b, now);
             float beatsSig = 0f;
             for (int i = 0; i < beats.Count; i++) beatsSig += Wave(beats[i], (float)(t - beats[i].t0), b);
+            for (int i = 0; i < buriedP.Count; i++)
+            {
+                float sp = (float)(t - buriedP[i].t0);
+                if (sp > 0f && sp < 0.14f) beatsSig += buriedP[i].amp * G(sp, PPeak, 0.021f);
+            }
 
             if (!Plugin.staging.Value)
             {
@@ -237,6 +252,7 @@ namespace EcgPlus
                 if (b.inCardiacArrest && arrestStart < 0) { arrestStart = now; arrestBrain = b.brainHealth; }
                 nextT = now + 0.5;   // first beat comes a moment after ROSC
                 beats.Clear();
+                buriedP.Clear();
                 return;
             }
             arrestStart = -1;
@@ -248,7 +264,7 @@ namespace EcgPlus
             {
                 var bt = beats[i];
                 if (bt.thumped) continue;
-                double rT = bt.t0 + (bt.kind == Normal ? bt.pr + bt.qrs * 0.45f : 0.05f);
+                double rT = bt.t0 + (bt.kind == Normal ? bt.pr + bt.qrs * 0.45f : PvcR);
                 if (now < rT) continue;
                 bt.thumped = true;
                 beats[i] = bt;
@@ -287,6 +303,7 @@ namespace EcgPlus
         {
             lastBody = b;
             beats.Clear();
+            buriedP.Clear();
             nextT = now;
             nextKind = Normal;
             runLeft = 0;
@@ -333,6 +350,7 @@ namespace EcgPlus
             if (kind == Normal)
             {
                 sinusNext = T + rr;   // the sinus node keeps its own clock through ectopy
+                sinusRR = rr;
                 if (r < pSus) { SetVtRate(hr); curRun = ++runCounter; curSus = true; nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
                 else if (r < pSus + pRun) { SetVtRate(hr); curRun = ++runCounter; curSus = false; runLeft = RunExtraBeats(f); nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
                 else if (r < pSus + pRun + pPvc) { runLeft = 0; curRun = ++runCounter; curSus = false; nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
@@ -346,9 +364,9 @@ namespace EcgPlus
                 else
                 {
                     // first sinus P whose QRS falls outside the ventricular refractory period conducts;
-                    // the ones before it are blocked -> compensatory pause
+                    // the ones before it are blocked -> compensatory pause (each blocked P still shows, buried in the T)
                     double sn = sinusNext;
-                    while (sn + 0.16 < T + 0.42) sn += rr;
+                    while (sn + 0.16 < T + 0.42) { AddBuriedP(sn, f); sn += rr; }
                     nextKind = Normal; nextT = sn;
                     var lastV = beats[beats.Count - 1];
                     lastV.tail = true;
@@ -358,11 +376,21 @@ namespace EcgPlus
                 // otherwise the triangle/sine wave gets a gap or a double-up at every seam
                 if (nextKind == Ventricular)
                 {
+                    // AV dissociation during a run: the sinus node keeps its own (slower) rate
+                    while (sinusNext < nextT) { AddBuriedP(sinusNext, f); sinusNext += sinusRR; }
                     var last = beats[beats.Count - 1];
                     last.per = (float)(nextT - T);
                     beats[beats.Count - 1] = last;
                 }
             }
+        }
+
+        static void AddBuriedP(double t0, float f)
+        {
+            float amp = 0.12f * (1f - TriWeight(f));   // lost in the fused triangle / flutter wave
+            if (amp <= 0.01f) return;
+            buriedP.Add(new PWave { t0 = t0, amp = amp });
+            if (buriedP.Count > 8) buriedP.RemoveAt(0);
         }
 
         // ventricular rate = the game's heart rate (which already climbs with fibrillation), so the monitor
@@ -382,16 +410,15 @@ namespace EcgPlus
             if (s < 0f) return 0f;
             if (bt.kind == Ventricular)
             {
-                // wide bizarre QRS, no P, discordant T
-                float tmpl = s > 0.5f ? 0f : 0.9f * G(s, 0.05f, 0.03f) - 0.55f * G(s, 0.125f, 0.03f) - 0.3f * G(s, 0.3f, 0.06f);
+                float tmpl = Pvc(s);
                 if (bt.fib <= 36f) return tmpl;
                 // ventricular complexes fuse into a triangle wave (36-65, faint at 40), then round off into flutter's sine (71-77, flutter from 75).
-                // Phase-aligned with the template (peak at 50 ms) so blending doesn't cancel amplitude.
+                // Phase-aligned with the template (R peak at PvcR) so blending doesn't cancel amplitude.
                 float x = s / bt.per;
-                float sn = x < 1f ? Mathf.Sin(2f * Mathf.PI * (x + 0.25f - 0.05f / bt.per)) : 0f;
+                float sn = x < 1f ? Mathf.Sin(2f * Mathf.PI * (x + 0.25f - PvcR / bt.per)) : 0f;
                 // the wave climbs again after its trough to meet the next ventricular complex; on the last one of a
                 // run (or a lone PVC) ease from the trough back to baseline instead
-                float xTrough = 0.5f + 0.05f / bt.per;
+                float xTrough = 0.5f + PvcR / bt.per;
                 if (bt.tail && x > xTrough && x < 1f) sn = -(1f - Smooth(xTrough, 1f, x));
                 float tri = x < 1f ? Mathf.Asin(sn) * (2f / Mathf.PI) : 0f;
                 float periodic = 0.9f * Mathf.Lerp(tri, sn, Smooth(71f, 77f, bt.fib));
@@ -400,6 +427,12 @@ namespace EcgPlus
             }
             float pr = bt.pr, qrs = bt.qrs, qt = bt.qt;
             if (s > pr + qt + 0.1f) return 0f;
+            if (Plugin.fixST.Value)
+            {
+                float sv = Sinus(s, pr, qrs, qt);
+                if (bt.j > 0f) sv += bt.j * G(s, pr + qrs + 0.03f, 0.032f);
+                return sv;
+            }
             float c;
             if (s < pr) c = Mathf.Lerp(-0.1f, 0.164f, s / pr);
             else if (s < pr + qrs)
@@ -412,16 +445,37 @@ namespace EcgPlus
             else if (s < pr + qt) c = Mathf.Lerp(0.441f, 0.86f, (s - pr - qrs) / (qt - qrs));
             else c = Mathf.Lerp(0.86f, 1f, (s - pr - qt) / 0.1f);
             float v = b.heartCurveNormal.Evaluate(c);
-            if (Plugin.fixST.Value) v += StLift(c);
             if (bt.j > 0f) v += bt.j * G(s, pr + qrs + 0.03f, 0.032f);   // wide enough to span 2-3 monitor pixels
             return v;
         }
 
-        static float StLift(float c)
+        // Ventricular complex (lead II, RV-origin PVC): wide monophasic R (~150 ms), whose downstroke runs straight
+        // into a deep discordant T - no separate S wave and no return to baseline in between (ST and T merge).
+        // The inverted T is asymmetric like a real secondary T inversion: slow downslope, fast return.
+        internal const float PvcR = 0.075f, PvcT = 0.34f;
+        static float Pvc(float s)
         {
-            if (c >= 0.372f && c < 0.441f) return 0.291f * (c - 0.372f) / 0.069f;
-            if (c >= 0.441f && c < 0.62f) return 0.291f * (1f - (c - 0.441f) / 0.179f);
-            return 0f;
+            if (s <= 0f || s > 0.62f) return 0f;
+            float r = 1.25f * AG(s, PvcR, 0.048f, 0.04f);   // peak ~1.15 after the T overlap: taller than sinus R (~1.0)   // blunt upstroke: slow muscle-to-muscle conduction
+            float t = 0.58f * AG(s, PvcT, 0.14f, 0.045f);
+            return (r - t) * Smooth(0f, 0.05f, s);   // slurred start from baseline
+        }
+
+        static float AG(float x, float mu, float left, float right) => G(x, mu, x < mu ? left : right);
+
+        // Sinus beat (lead II, a bit exaggerated for the small screen): S about half of R (real lead II ~1/5),
+        // S returns smoothly through J onto a flat ST, then an asymmetric T (slow upstroke, quicker downstroke)
+        // peaking ~2/3 of the way from J to the end of QT. Replaces the vanilla curve, whose ST dips and bumps.
+        internal const float SP = 0.356f, SQ = 0.12f, SR = 0.45f, SS = 0.72f, ST = 0.65f;   // feature positions
+        static float Sinus(float s, float pr, float qrs, float qt)
+        {
+            if (s <= 0f) return 0f;
+            float L = qt - qrs;
+            return 0.12f * G(s, pr * SP, pr * 0.131f)                 // P
+                 - 0.22f * G(s, pr + SQ * qrs, 0.11f * qrs)           // q (deep/wide enough to survive 28 ms pixels)
+                 + 1.00f * G(s, pr + SR * qrs, 0.13f * qrs)           // R
+                 - 0.50f * G(s, pr + SS * qrs, 0.10f * qrs)           // S
+                 + 0.30f * AG(s, pr + qrs + ST * L, 0.26f * L, 0.15f * L);   // T
         }
 
         static float VF(double t)
@@ -446,21 +500,18 @@ namespace EcgPlus
             if (bt.kind == Normal)
             {
                 float pr = bt.pr, qrs = bt.qrs, qt = bt.qt;
-                o.Add(("P", pr * 0.356f, false));
-                o.Add(("Q", pr, true));
-                o.Add(("R", pr + 0.45f * qrs, false));
-                o.Add(("S", pr + 0.72f * qrs, true));
+                bool own = Plugin.fixST.Value;
+                o.Add(("P", pr * SP, false));
+                o.Add(("Q", own ? pr + SQ * qrs : pr, true));
+                o.Add(("R", pr + SR * qrs, false));
+                o.Add(("S", pr + SS * qrs, true));
                 if (bt.j >= 0.1f) o.Add(("J", pr + qrs + 0.03f, false));
-                o.Add(("T", pr + qrs + 0.427f * (qt - qrs), false));
+                o.Add(("T", pr + qrs + (own ? ST : 0.427f) * (qt - qrs), false));
             }
             else
             {
-                o.Add(("R", 0.05f, false));
-                if (TriWeight(bt.fib) < 0.5f)
-                {
-                    o.Add(("S", 0.125f, true));
-                    o.Add(("T", 0.3f, true));   // inverted
-                }
+                o.Add(("R", PvcR, false));
+                if (TriWeight(bt.fib) < 0.5f) o.Add(("T", PvcT, true));   // inverted, merged with ST
             }
         }
 

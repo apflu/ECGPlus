@@ -30,7 +30,7 @@ namespace EcgPlus
 
         class Mark { public string text; public double t; public bool below, isType, normal, placed; public float yPix; public int run; public TextMeshProUGUI ui; }
         const double SegEvery = 1.5;
-        double lastSeg, lastSeenT0;
+        double lastSeg, lastSeenT0, lastSeenP;
         readonly List<Mark> marks = new List<Mark>();
         readonly Stack<TextMeshProUGUI> pool = new Stack<TextMeshProUGUI>();
         readonly Dictionary<int, Mark> runMark = new Dictionary<int, Mark>();
@@ -63,7 +63,7 @@ namespace EcgPlus
             Array.Clear(alpha, 0, alpha.Length);
             ClearMarks();
             writeX = 0; lastY = H / 2;
-            lastT = lastSeenT0 = Time.unscaledTime;
+            lastT = lastSeenT0 = lastSeenP = Time.unscaledTime;
             lastSeg = 0;
         }
 
@@ -107,7 +107,7 @@ namespace EcgPlus
                 lastY = y;
             }
 
-            if (markVersion != settingsVersion) { ClearMarks(); lastSeenT0 = now; lastSeg = 0; markVersion = settingsVersion; }
+            if (markVersion != settingsVersion) { ClearMarks(); lastSeenT0 = lastSeenP = now; lastSeg = 0; markVersion = settingsVersion; }
             UpdateMarks(b, now);
 
             for (int i = 0; i < px.Length; i++)
@@ -231,12 +231,21 @@ namespace EcgPlus
                         marks.Add(new Mark { text = Ui.L("N"), t = bt.t0 + bt.pr + 0.45f * bt.qrs, isType = true, normal = true });
                     else if (!runMark.ContainsKey(bt.run))
                     {
-                        var m = new Mark { text = "", t = bt.t0 + 0.05, isType = true, run = bt.run };
+                        var m = new Mark { text = "", t = bt.t0 + Rhythm.PvcR, isType = true, run = bt.run };
                         runMark[bt.run] = m;
                         marks.Add(m);
                     }
                 }
             }
+
+            // sinus P waves buried in ventricular beats
+            if (markWaves && !skip)
+                foreach (var pw in Rhythm.BuriedP)
+                {
+                    if (pw.t0 <= lastSeenP) continue;
+                    lastSeenP = pw.t0;
+                    marks.Add(new Mark { text = "P", t = pw.t0 + Rhythm.PPeak, below = false });
+                }
 
             // continuous rhythms (sustained VT, flutter, VF, arrest): name the rhythm every 1.5 s of trace
             if (markTypes)

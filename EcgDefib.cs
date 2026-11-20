@@ -99,9 +99,16 @@ namespace EcgPlus
             Text(panel, "/", -330f, mid, 24f, grey, font, fontMat, 33.33f);
             Place(panel, kids[2], -255f, mid, 120f, TextAlignmentOptions.MidlineLeft);
             Text(panel, "J", -222f, mid - 10f, 16f, w, font, fontMat, 20f);
-            // BPM
-            Caption(panel, "BPM", Cols[1] + Line + 6f, top - 2f, font, fontMat, grey);
-            Place(panel, kids[5], (Cols[1] + Cols[2]) / 2f, mid - 4f, Cols[2] - Cols[1] - 10f, TextAlignmentOptions.Center);
+            // HR (counted from our ECG) / PR (pulse: the game's heart rate, vanilla's BPM text)
+            var bpmTmp = kids[5].GetComponent<TextMeshProUGUI>();
+            var bpTmp = kids[8].GetComponent<TextMeshProUGUI>();
+            Inline(panel, "HR", Cols[1] + Line + 8f, rowA, font, fontMat, grey);
+            hrColor = bpmTmp != null ? bpmTmp.color : w;
+            hrText = NewText(panel, "", font, fontMat, hrColor, bpTmp != null ? bpTmp.fontSize : 33.33f);
+            Place(panel, (RectTransform)hrText.transform, -85f, rowA, 110f, TextAlignmentOptions.MidlineLeft);
+            Inline(panel, "PR", Cols[1] + Line + 8f, rowB, font, fontMat, grey);
+            if (bpmTmp != null && bpTmp != null) { bpmTmp.fontSize = bpTmp.fontSize; bpmTmp.enableAutoSizing = false; }
+            Place(panel, kids[5], -85f, rowB, 110f, TextAlignmentOptions.MidlineLeft);
             // BP / SpO2
             Inline(panel, "BP", Cols[2] + Line + 8f, rowA, font, fontMat, grey);
             Place(panel, kids[8], 125f, rowA, 160f, TextAlignmentOptions.MidlineLeft);
@@ -147,7 +154,7 @@ namespace EcgPlus
 
             bool onTorso = Traverse.Create(mg).Field("onTorso").GetValue<bool>();
             float rw = row.sizeDelta.x, rhh = row.sizeDelta.y;
-            monitor = new EcgMonitor(raw, Mathf.RoundToInt(rw / 2f), Mathf.RoundToInt(rhh / 2f), 0.007f, false, 24f) { rhythm = rhythm, flat = !onTorso };
+            monitor = new EcgMonitor(raw, Mathf.RoundToInt(rw / 2f), Mathf.RoundToInt(rhh / 2f), 0.007f, true, 24f) { rhythm = rhythm, flat = !onTorso };
 
             // marks on/off soft key, right of the SHCK button (clicked with the minigame hand, see DefibUpdatePatch)
             const float bx = 470f, by = -350f, bw = 170f, bh = 56f;
@@ -167,14 +174,21 @@ namespace EcgPlus
         }
 
         internal static GameObject markKey;
+        internal static TextMeshProUGUI hrText;
+        internal static Color hrColor = Color.white;
         internal static TextMeshProUGUI markLabel;
         static string lastOn = "all";
 
         internal static bool MarksOn => EcgMonitor.markWaves || EcgMonitor.markTypes;
 
+        // auto labels need the INT to recognize the manual defibrillator itself (vanilla Recognition, INT 8)
+        internal static bool CanRead =>
+            Item.GlobalItems != null && Item.GlobalItems.TryGetValue("manualdefibrillator", out var info) && info.rec != null && info.rec.recognizable;
+
         // toggle: off <-> whatever was last on (console "ecgview mark waves/types/all" still picks the mode)
         internal static void ToggleMarks()
         {
+            if (!CanRead) return;
             if (MarksOn)
             {
                 lastOn = EcgMonitor.markWaves && EcgMonitor.markTypes ? "all" : EcgMonitor.markWaves ? "waves" : "types";
@@ -187,6 +201,12 @@ namespace EcgPlus
         internal static void RefreshKey()
         {
             if (markLabel == null) return;
+            if (!CanRead)
+            {
+                markLabel.text = "MARK ---";
+                markLabel.color = new Color(0.3f, 0.3f, 0.3f);
+                return;
+            }
             bool on = MarksOn;
             markLabel.text = on ? "MARK ON" : "MARK OFF";
             markLabel.color = on ? EcgMonitor.MarkColor : new Color(0.55f, 0.55f, 0.55f);
@@ -284,6 +304,20 @@ namespace EcgPlus
             if (Minigame.game != null && Minigame.game.handStartedClicking && uiCasts != null && DefibScreenPatch.markKey != null)
                 foreach (var c in uiCasts)
                     if (c.gameObject == DefibScreenPatch.markKey) { DefibScreenPatch.ToggleMarks(); break; }
+            m.noMarks = !DefibScreenPatch.CanRead;
+            if (DefibScreenPatch.hrText != null && PlayerCamera.main != null && PlayerCamera.main.body != null)
+            {
+                var body = PlayerCamera.main.body;
+                float hr = m.flat ? -1f : Rhythm.EcgRate(body);
+                var t = DefibScreenPatch.hrText;
+                t.text = hr < 0f ? "---" : Mathf.RoundToInt(hr).ToString();
+                // alarm: the ECG rate and the pulse disagree (flutter: pulse deficit) or can't be counted (VF / arrest).
+                // Flashes red at 2 Hz; nothing to alarm on while the paddles are off the chest.
+                float pr = body.heartRate;
+                bool alarm = !m.flat && (hr < 0f || Mathf.Abs(hr - pr) > 0.1f * Mathf.Max(pr, 1f));
+                bool red = alarm && Mathf.Repeat(Time.unscaledTime * 2f, 1f) < 0.5f;
+                t.color = red ? new Color(1f, 0.2f, 0.2f) : DefibScreenPatch.hrColor;
+            }
             DefibScreenPatch.RefreshKey();
             var b = PlayerCamera.main != null ? PlayerCamera.main.body : null;
             if (b == null) return;

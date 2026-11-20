@@ -27,12 +27,15 @@ namespace EcgPlus
         double lastT;
         public TextMeshProUGUI rhythm;   // optional rhythm name label, owned by the caller
         public bool flat;                // draw a flat line (paddles not on the chest)
+        public bool noMarks;             // labels unavailable (defib screen: the player cannot read the device)
+        public Func<Body, float, float> source;   // optional sampler (sync view: vanilla curve on our beats)
 
         class Mark { public string text; public double t; public bool below, isType, normal, placed; public float yPix; public int run; public TextMeshProUGUI ui; }
         const double SegEvery = 1.5;
         double lastSeg, lastSeenT0, lastSeenP;
         readonly List<Mark> marks = new List<Mark>();
-        static readonly List<Mark> waveTmp = new List<Mark>();
+        static readonly List<Mark> waveTmp = new List<Mark>(), typeTmp = new List<Mark>();
+        static int TypeRank(Mark m) => m.run != 0 ? 2 : m.normal ? 1 : 0;
         readonly Stack<TextMeshProUGUI> pool = new Stack<TextMeshProUGUI>();
         readonly Dictionary<int, Mark> runMark = new Dictionary<int, Mark>();
         readonly Dictionary<int, int> runLen = new Dictionary<int, int>();
@@ -94,7 +97,7 @@ namespace EcgPlus
             {
                 lastT += colDt;
                 float off = (float)(now - lastT);
-                float v = flat ? 0f : Plugin.on.Value ? Rhythm.Sample(b, off) : b.GetECGHeight(off);
+                float v = flat ? 0f : source != null ? source(b, off) : Plugin.on.Value ? Rhythm.Sample(b, off) : b.GetECGHeight(off);
                 int y = Mathf.Clamp(Mathf.RoundToInt((v * 0.85f + 1f) * 0.5f * (H - 1)), 0, H - 1);
                 writeX = (writeX + 1) % W;
                 int y0 = Mathf.Min(lastY, y), y1 = Mathf.Max(lastY, y);
@@ -176,7 +179,7 @@ namespace EcgPlus
             if (bs.Count > 0 && bs[bs.Count - 1].kind == 1 && bs[bs.Count - 1].sus)
             {
                 if (Rhythm.SineWeight(f) >= 0.5f) return Ui.L("V-flutter");
-                return Ui.L(Rhythm.TriWeight(f) >= 0.5f ? "VT (triangle)" : "VT");
+                return Ui.L(Rhythm.FuseNow >= 0.5f ? "VT (triangle)" : "VT");
             }
             string lqt = LongQt.Dominant();
             return Ui.L(f > 15f ? "Sinus w/ PVCs" : "Sinus") + (lqt.Length > 0 ? " · " + lqt : "");
@@ -192,7 +195,7 @@ namespace EcgPlus
             if (bs.Count > 0 && bs[bs.Count - 1].kind == 1 && bs[bs.Count - 1].sus)
             {
                 if (Rhythm.SineWeight(f) >= 0.5f) return Ui.L("V-flutter");
-                return Rhythm.TriWeight(f) >= 0.5f ? Ui.L("VT (triangle)") : (Ui.Zh ? "室速" : "VT");
+                return Rhythm.FuseNow >= 0.5f ? Ui.L("VT (triangle)") : (Ui.Zh ? "室速" : "VT");
             }
             return null;
         }
@@ -207,7 +210,7 @@ namespace EcgPlus
 
         void UpdateMarks(Body b, double now)
         {
-            bool on = Plugin.on.Value && !flat && (markWaves || markTypes);
+            bool on = Plugin.on.Value && !flat && !noMarks && (markWaves || markTypes);
             if (rhythm != null) rhythm.text = on && markTypes ? RhythmName(b) : "";
             if (!on) { if (marks.Count > 0) ClearMarks(); return; }
 
@@ -303,34 +306,49 @@ namespace EcgPlus
             foreach (var m in marks)
                 if (!m.isType && m.ui != null && m.ui.enabled && lastT >= m.t) waveTmp.Add(m);
             waveTmp.Sort((p, q) => p.t.CompareTo(q.t));
-            // compare every pair close in time, not just neighbours: Q and S have the R label between them
-            for (int i = 0; i < waveTmp.Count; i++)
-                for (int j = i + 1; j < waveTmp.Count && waveTmp[j].t - waveTmp[i].t < 0.3; j++)
-                {
-                    var ra = (RectTransform)waveTmp[i].ui.transform;
-                    var rb = (RectTransform)waveTmp[j].ui.transform;
-                    Vector2 pa = ra.anchoredPosition, pb = rb.anchoredPosition;
-                    float need = (LabelWidth(waveTmp[i].ui) + LabelWidth(waveTmp[j].ui)) * 0.5f + 2f;
-                    float dx = pb.x - pa.x;   // newer label is to the right (negative = wrapped around the sweep)
-                    if (dx < 0f || dx >= need || Mathf.Abs(pb.y - pa.y) >= labelSize * 0.9f) continue;
-                    float push = (need - dx) * 0.5f;
-                    ra.anchoredPosition = new Vector2(pa.x - push, pa.y);
-                    rb.anchoredPosition = new Vector2(pb.x + push, pb.y);
-                }
-
-            // colliding type labels: a run label (PVC / couplet / NSVT ...) wins over a "normal" one
-            for (int i = 0; i < marks.Count; i++)
+            // compare every pair close in time, not just neighbours: Q and S have the R label between them.
+            // Several passes: a cluster of three (the T of a VT beat landing on a capture beat's Q and S) needs
+            // the first push to propagate.
+            for (int pass = 0; pass < 6; pass++)
             {
-                var a = marks[i];
-                if (!a.isType || a.run == 0 || a.ui == null) continue;
+                bool moved = false;
+                for (int i = 0; i < waveTmp.Count; i++)
+                    for (int j = i + 1; j < waveTmp.Count && waveTmp[j].t - waveTmp[i].t < 0.4; j++)
+                    {
+                        var ra = (RectTransform)waveTmp[i].ui.transform;
+                        var rb = (RectTransform)waveTmp[j].ui.transform;
+                        Vector2 pa = ra.anchoredPosition, pb = rb.anchoredPosition;
+                        float need = (LabelWidth(waveTmp[i].ui) + LabelWidth(waveTmp[j].ui)) * 0.5f + 2f;
+                        float dx = pb.x - pa.x;   // newer label is to the right (negative = wrapped around the sweep)
+                        if (dx < -need * 0.5f || dx >= need || Mathf.Abs(pb.y - pa.y) >= labelSize * 0.9f) continue;
+                        float push = (need - dx) * 0.5f;
+                        ra.anchoredPosition = new Vector2(pa.x - push, pa.y);
+                        rb.anchoredPosition = new Vector2(pb.x + push, pb.y);
+                        moved = true;
+                    }
+                if (!moved) break;
+            }
+
+            // colliding type labels: keep one. A run label (PVC / couplet / NSVT / VT) beats a beat label (N),
+            // which beats the periodic rhythm name; on a tie the older one stays (two "VT"s read as "VVT")
+            typeTmp.Clear();
+            foreach (var m in marks)
+                if (m.isType && m.ui != null && m.ui.enabled && lastT >= m.t) typeTmp.Add(m);
+            typeTmp.Sort((p, q) => p.t.CompareTo(q.t));
+            for (int i = 0; i < typeTmp.Count; i++)
+            {
+                var a = typeTmp[i];
+                if (!a.ui.enabled) continue;
                 var ra = (RectTransform)a.ui.transform;
-                float aw = a.ui.preferredWidth * 0.5f;
-                for (int j = 0; j < marks.Count; j++)
+                for (int j = i + 1; j < typeTmp.Count; j++)
                 {
-                    var n = marks[j];
-                    if (!n.normal || n.ui == null) continue;
+                    var n = typeTmp[j];
+                    if (!n.ui.enabled) continue;
                     var rn = (RectTransform)n.ui.transform;
-                    if (Mathf.Abs(ra.anchoredPosition.x - rn.anchoredPosition.x) < aw + n.ui.preferredWidth * 0.5f) n.ui.enabled = false;
+                    float need = (LabelWidth(a.ui) + LabelWidth(n.ui)) * 0.5f + 4f;
+                    if (Mathf.Abs(ra.anchoredPosition.x - rn.anchoredPosition.x) >= need) continue;
+                    if (TypeRank(n) > TypeRank(a)) { a.ui.enabled = false; break; }
+                    n.ui.enabled = false;
                 }
             }
         }

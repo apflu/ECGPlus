@@ -8,6 +8,7 @@ namespace EcgPlus
     // Big ECG window ("ecgview" console command, Esc closes): centered, 66% of the screen width,
     // drawn at 4x the time resolution of the in-game monitor (7 ms per column instead of 28 ms).
     // Frame sprite, font and trace color are borrowed from the health panel at runtime.
+    // "ecgview sync": a second trace on top draws the vanilla curve locked to the same beats (Rhythm.SampleVanilla).
     internal static class EcgView
     {
         const int W = 640, H = 200;
@@ -16,19 +17,25 @@ namespace EcgPlus
         static Canvas canvas;
         static RectTransform panel;
         static Image frame;
-        static RawImage trace;
-        static TextMeshProUGUI header, rhythm;
-        static EcgMonitor mon;
-        static bool styled;
+        static RawImage trace, vtrace;
+        static TextMeshProUGUI header, rhythm, vtag, ptag;
+        static EcgMonitor mon, vmon;
+        static bool styled, sync;
 
         public static bool IsOpen => root != null && root.activeSelf;
 
-        public static void Toggle()
+        // plain "ecgview" toggles; "ecgview sync" opens the comparison (or switches an open plain view to it)
+        public static void Toggle(bool syncMode = false)
         {
-            if (IsOpen) { root.SetActive(false); return; }
+            if (IsOpen && sync == syncMode) { root.SetActive(false); return; }
             if (PlayerCamera.main == null || PlayerCamera.main.body == null) throw new Exception("No world is loaded.");
             if (root == null) Build();
+            sync = syncMode;
+            vtrace.gameObject.SetActive(sync);
+            vtag.gameObject.SetActive(sync);
+            ptag.gameObject.SetActive(sync);
             mon.Reset();
+            vmon.Reset();
             styled = false;
             root.SetActive(true);
         }
@@ -75,7 +82,35 @@ namespace EcgPlus
             trace.color = new Color(0.35f, 1f, 0.55f, 1f);
 
             mon = new EcgMonitor(trace, W, H, 0.007f, true, 28f) { rhythm = rhythm };
+
+            var vt = new GameObject("VanillaTrace", typeof(RectTransform)).GetComponent<RectTransform>();
+            vt.SetParent(panel, false);
+            vt.anchorMin = Vector2.zero; vt.anchorMax = Vector2.one;
+            vtrace = vt.gameObject.AddComponent<RawImage>();
+            vtrace.raycastTarget = false;
+            vtrace.color = trace.color;
+            vmon = new EcgMonitor(vtrace, W, H, 0.007f, true, 28f) { noMarks = true, source = Rhythm.SampleVanilla };
+
+            vtag = Tag("VANILLA", vt);
+            ptag = Tag("PLUS", tr);
             root.SetActive(false);
+        }
+
+        static TextMeshProUGUI Tag(string text, RectTransform parent)
+        {
+            var rt = new GameObject("Tag", typeof(RectTransform)).GetComponent<RectTransform>();
+            rt.SetParent(parent, false);
+            rt.anchorMin = rt.anchorMax = rt.pivot = new Vector2(0f, 1f);
+            rt.anchoredPosition = new Vector2(8f, -6f);
+            rt.sizeDelta = new Vector2(200f, 30f);
+            var t = rt.gameObject.AddComponent<TextMeshProUGUI>();
+            t.raycastTarget = false;
+            t.text = text;
+            t.fontSize = 18f;
+            t.alignment = TextAlignmentOptions.TopLeft;
+            t.enableWordWrapping = false;
+            t.color = new Color(0.6f, 0.6f, 0.6f, 0.9f);
+            return t;
         }
 
         // borrow the health panel's look once it exists (frame sprite, font, trace tint, UI scale)
@@ -110,7 +145,9 @@ namespace EcgPlus
             Ui.ApplyLabelFont(rhythm);
             var ecg = wv.GetComponentInChildren<ECGVisualizer>(true);
             var src = ecg != null ? ecg.GetComponent<RawImage>() : null;
-            if (src != null) { trace.color = src.color; trace.material = src.material; }
+            if (src != null) { trace.color = vtrace.color = src.color; trace.material = vtrace.material = src.material; }
+            foreach (var t in new[] { vtag, ptag })
+                if (bpm != null) { t.font = bpm.font; t.fontSharedMaterial = bpm.fontSharedMaterial; }
         }
 
         public static void Tick()
@@ -123,9 +160,12 @@ namespace EcgPlus
             Layout();
 
             var b = cam.body;
-            var view = cam.woundView != null ? cam.woundView.GetComponent<WoundView>() : null;
-            header.text = view != null && view.bpmText != null ? view.bpmText.text : Mathf.RoundToInt(b.heartRate) + " | " + b.bloodPressureReadout;
+            // HR = counted from the ECG (ventricular rate), PR = pulse (the game's heart rate); they part in flutter
+            float hr = Plugin.on.Value ? Rhythm.EcgRate(b) : b.heartRate;
+            string hrs = hr < 0f ? "---" : Mathf.RoundToInt(hr).ToString();
+            header.text = "HR " + hrs + "  PR " + Mathf.RoundToInt(b.heartRate) + "  |  " + b.bloodPressureReadout;
             mon.Tick(b);
+            if (sync) vmon.Tick(b);
         }
 
         static void Layout()
@@ -134,13 +174,23 @@ namespace EcgPlus
             float w = Screen.width * 0.66f / sf;
             float traceH = w * H / W;
             float pad = 10f, headH = Mathf.Max(18f, header.fontSize * 1.4f);
-            panel.sizeDelta = new Vector2(w + pad * 2, traceH + headH + pad * 2);
+            float gap = sync ? pad : 0f, total = sync ? traceH * 2 + gap : traceH;
+            panel.sizeDelta = new Vector2(w + pad * 2, total + headH + pad * 2);
             var hdr = (RectTransform)header.transform;
             hdr.offsetMin = new Vector2(pad * 1.5f, -pad - headH);
             hdr.offsetMax = new Vector2(-pad * 1.5f, -pad);
+            // plus: bottom trace (or the only one); vanilla: above it
             var tr = (RectTransform)trace.transform;
+            tr.anchorMin = Vector2.zero; tr.anchorMax = new Vector2(1f, 0f);
             tr.offsetMin = new Vector2(pad, pad);
-            tr.offsetMax = new Vector2(-pad, -pad - headH);
+            tr.offsetMax = new Vector2(-pad, pad + traceH);
+            if (sync)
+            {
+                var vt = (RectTransform)vtrace.transform;
+                vt.anchorMin = Vector2.zero; vt.anchorMax = new Vector2(1f, 0f);
+                vt.offsetMin = new Vector2(pad, pad + traceH + gap);
+                vt.offsetMax = new Vector2(-pad, pad + traceH * 2 + gap);
+            }
         }
     }
 }

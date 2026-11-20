@@ -10,7 +10,7 @@ namespace EcgPlus
     // ECG rework: what Body.GetECGHeight returns to the ECG screen, the big "ecgview" monitor, the manual
     // defib screen, and text fixes. Gameplay changes are limited to the arrest shock rework (EcgArrest.cs,
     // config toggle) and the opt-in long QT challenge run setting (EcgLongQt.cs).
-    [BepInPlugin("local.cu.ecgplus", "CU ECG Plus", "1.1.0")]
+    [BepInPlugin("local.cu.ecgplus", "CU ECG Plus", "1.2.0")]
     public class Plugin : BaseUnityPlugin
     {
         internal static ConfigEntry<bool> on, fixST, staging, jWave, lowVoltage, textFixes, arrestShock;
@@ -115,7 +115,7 @@ namespace EcgPlus
                 Traverse.Create(ConsoleScript.instance).Method("LogToConsole", new[] { typeof(string) })
                     .GetValue("ECG: " + (Plugin.on.Value ? "EcgPlus" : "vanilla"));
             }, new Dictionary<int, List<string>> { { 0, new List<string> { "plus", "vanilla" } } }, ("mode", "plus / vanilla; empty = toggle")));
-            ConsoleScript.Commands.Add(new Command("ecgview", "Opens or closes a large ECG monitor (Esc also closes). ecgview mark waves|types|all|off [force] labels PQRST/J and beat types (below 150 bpm unless forced).", delegate (string[] args)
+            ConsoleScript.Commands.Add(new Command("ecgview", "Opens or closes a large ECG monitor (Esc also closes). ecgview mark waves|types|all|off [force] labels PQRST/J and beat types (below 150 bpm unless forced). ecgview sync shows vanilla above EcgPlus, locked to the same beats.", delegate (string[] args)
             {
                 if (args.Length >= 3 && args[1] == "mark")
                 {
@@ -123,9 +123,9 @@ namespace EcgPlus
                     Traverse.Create(ConsoleScript.instance).Method("LogToConsole", new[] { typeof(string) }).GetValue(msg);
                     return;
                 }
-                EcgView.Toggle();
-            }, new Dictionary<int, List<string>> { { 0, new List<string> { "mark" } }, { 1, new List<string> { "waves", "types", "all", "off" } }, { 2, new List<string> { "force" } } },
-               ("mark", "optional: mark"), ("what", "waves / types / all / off"), ("force", "optional: also label above 150 bpm")));
+                EcgView.Toggle(args.Length >= 2 && args[1] == "sync");
+            }, new Dictionary<int, List<string>> { { 0, new List<string> { "mark", "sync" } }, { 1, new List<string> { "waves", "types", "all", "off" } }, { 2, new List<string> { "force" } } },
+               ("mark", "optional: mark / sync"), ("what", "waves / types / all / off"), ("force", "optional: also label above 150 bpm")));
             ConsoleScript.Commands.Add(new Command("lqt", "Long QT challenge: shows the fibrillation rise per subtype. lqt <key> <value> tunes a rate (saved to the config).", delegate (string[] args)
             {
                 Traverse.Create(ConsoleScript.instance).Method("LogToConsole", new[] { typeof(string) }).GetValue(LongQt.Command(args));
@@ -173,7 +173,9 @@ namespace EcgPlus
             public bool tail;   // ventricular beat followed by a normal beat: no upswing into a next complex
             public int run;     // ventricular: id of the run this beat belongs to (single PVC = run of 1)
             public bool sus;    // ventricular: scheduled as sustained VT rather than a counted run
-            public float amp0, amp1;   // ventricular: amplitude at the start / end of this cycle (flutter degrading, fib 80-95)
+            public float amp0, amp1;   // ventricular: amplitude at the start / end of this cycle (beat-to-beat size)
+            public float fuse;         // ventricular: 0 = separate wide QRS + discordant T .. 1 = fused periodic wave
+            public float wK, tK, warp; // ventricular: per-beat width / T depth / waveform skew (beat-to-beat variation)
         }
 
         static readonly List<Beat> beats = new List<Beat>();
@@ -237,6 +239,145 @@ namespace EcgPlus
             if (b.defibShockedFrames > 0) return (float)(rng.NextDouble() * 2.0 - 1.0);
             if (!b.alive || b != lastBody) return 0f;
             return Raw(b, offset, 0f);
+        }
+
+        // "ecgview sync": the vanilla waveform (Body.GetECGHeight's formula, see VanillaAt), played back with a delay so
+        // its R waves land on our sinus R waves. Both clocks advance at heart rate / 60, and a PVC's
+        // compensatory pause keeps the sinus clock, so the delay is nearly constant; it is re-aimed every call
+        // and eased toward the target, so the trace never jumps.
+        static float vanillaRPhase = -1f;
+        static readonly List<double> blockedP = new List<double>();
+        static float lastPR = 0.16f, lastQRS = 0.09f;
+        static float vDelay = -1f;
+        static double vLastCall;
+
+        internal static float SampleVanilla(Body b, float offset)
+        {
+            if (b != lastBody) return 0f;
+            if (vanillaRPhase < 0f)
+            {
+                float best = float.MinValue;
+                for (int i = 0; i <= 400; i++)
+                {
+                    float v = b.heartCurveNormal.Evaluate(i / 400f);
+                    if (v > best) { best = v; vanillaRPhase = i / 400f; }
+                }
+            }
+            double now = Time.unscaledTime;
+            RecordVanilla(b, now);
+            float hr = b.heartRate;
+            if (hr > 0f)
+            {
+                float rr = 60f / hr;
+                // latest vanilla R: when the recorded phase last crossed the curve's R peak
+                double vanillaR = LastVanillaR();
+                // latest sinus R of ours (normal beats, the sinus beats a PVC blocked, sustained VT beats)
+                double ourR = double.MinValue;
+                for (int i = 0; i < beats.Count; i++)
+                    if (beats[i].kind == Normal)
+                    {
+                        lastPR = beats[i].pr; lastQRS = beats[i].qrs;
+                        double r = beats[i].t0 + beats[i].pr + SR * beats[i].qrs;
+                        if (r <= now && r > ourR) ourR = r;
+                    }
+                    else if (beats[i].sus && SineWeight(beats[i].fib) <= 0f)
+                    {
+                        double r = beats[i].t0 + PvcR;
+                        if (r <= now && r > ourR) ourR = r;
+                    }
+                for (int i = 0; i < blockedP.Count; i++)
+                {
+                    double r = blockedP[i] + lastPR + SR * lastQRS;
+                    if (r <= now && r > ourR) ourR = r;
+                }
+                // re-aim only when a new R (ours or vanilla's) has happened: between beats the target is fixed,
+                // so the delay doesn't wobble from frame to frame
+                if (ourR > double.MinValue && vanillaR > double.MinValue && (ourR != vAimOur || vanillaR != vAimVan))
+                {
+                    vAimOur = ourR; vAimVan = vanillaR;
+                    float target = (float)(ourR - vanillaR);
+                    target -= Mathf.Floor((target - 0.1f * rr) / rr) * rr;   // 0.1 rr .. 1.1 rr: room to drift both ways
+                    if (vDelay < 0f || now - vLastCall > 1.0) vDelay = vTarget = target;
+                    else
+                    {
+                        float d = target - vDelay;                          // shortest way around the cycle
+                        d -= Mathf.Round(d / rr) * rr;
+                        vTarget = vDelay + d;
+                    }
+                }
+            }
+            // ease toward the target at 10% of real time: the trace stretches a little instead of jumping
+            float dt = (float)(now - vLastCall);
+            if (vDelay >= 0f && dt > 0f && dt < 1f) vDelay = Mathf.Max(0f, Mathf.MoveTowards(vDelay, vTarget, 0.1f * dt));
+            vLastCall = now;
+            return VanillaAt(b, now - offset - Mathf.Max(vDelay, 0f));
+        }
+
+        // Recorded vanilla state, one entry per frame: the phase counter heartProg unwrapped into a continuous
+        // count, plus what GetECGHeight reads alongside it. Playing it back with a delay reproduces exactly
+        // what the vanilla monitor showed at that moment; extrapolating from the current heart rate would not,
+        // since the vanilla rate wobbles every frame and the error grows with the delay.
+        struct VFrame { public double t, ph; public float fib, var; public bool zero, shock; }
+        static readonly List<VFrame> vHist = new List<VFrame>();
+        static double vAimOur = -1, vAimVan = -1;
+        static float vTarget;
+
+        static void RecordVanilla(Body b, double now)
+        {
+            int n = vHist.Count;
+            if (n > 0 && vHist[n - 1].t >= now) return;
+            double ph = b.heartProg;
+            if (n > 0)
+            {
+                double prev = vHist[n - 1].ph, d = ph - (prev - Math.Floor(prev));
+                if (d < -0.5) d += 1.0;
+                if (d < 0) d = 0;   // never run backwards
+                ph = prev + d;
+            }
+            vHist.Add(new VFrame { t = now, ph = ph, fib = b.fibrillationProgress, var = b.randomFibrillationVariation, zero = b.heartRate <= 0f, shock = b.defibShockedFrames > 0 });
+            int drop = 0;
+            while (drop < vHist.Count - 2 && vHist[drop + 1].t < now - 4.0) drop++;
+            if (drop > 0) vHist.RemoveRange(0, drop);
+        }
+
+        static double LastVanillaR()
+        {
+            int n = vHist.Count;
+            if (n < 2) return double.MinValue;
+            double cur = vHist[n - 1].ph;
+            double k = Math.Floor(cur - vanillaRPhase) + vanillaRPhase;   // last crossing value
+            for (int i = n - 1; i > 0; i--)
+                if (vHist[i - 1].ph <= k && vHist[i].ph >= k)
+                {
+                    double span = vHist[i].ph - vHist[i - 1].ph;
+                    double u = span > 0 ? (k - vHist[i - 1].ph) / span : 0;
+                    return vHist[i - 1].t + u * (vHist[i].t - vHist[i - 1].t);
+                }
+            return double.MinValue;
+        }
+
+        // Body.GetECGHeight's own formula on the recorded state at time t (phase interpolated between frames)
+        static float VanillaAt(Body b, double t)
+        {
+            int n = vHist.Count;
+            if (n == 0) return 0f;
+            int i = n - 1;
+            while (i > 0 && vHist[i - 1].t > t) i--;
+            var hi = vHist[i];
+            double ph = hi.ph;
+            if (i > 0 && t < hi.t)
+            {
+                var lo = vHist[i - 1];
+                double u = (t - lo.t) / (hi.t - lo.t);
+                ph = lo.ph + Math.Max(0.0, Math.Min(1.0, u)) * (hi.ph - lo.ph);
+            }
+            if (hi.shock) return rng.NextDouble() > 0.5 ? 1f : -1f;
+            if (hi.zero) return 0f;
+            float x = (float)(ph - Math.Floor(ph));
+            float f = hi.fib;
+            float v = Mathf.Lerp(b.heartCurveNormal.Evaluate(x), b.heartCurveArrythmia.Evaluate(x), f / 90f) * hi.var;
+            if (f > 75f) v *= 1f - (f - 75f) / 25f;
+            return v;
         }
 
         static float Raw(Body b, float offset, float vanilla)
@@ -402,7 +543,7 @@ namespace EcgPlus
                 if (b.inCardiacArrest && arrestStart < 0) { arrestStart = now; arrestBrain = b.brainHealth; }
                 nextT = now + 0.5;   // first beat comes a moment after ROSC
                 beats.Clear();
-                buriedP.Clear();
+                buriedP.Clear(); blockedP.Clear();
                 return;
             }
             arrestStart = -1;
@@ -420,6 +561,13 @@ namespace EcgPlus
                 beats[i] = bt;
                 float strength = BeatStrength(bt, rT);
                 lastR = rT;
+                // flutter: only the beats that make a pulse (at the game's heart rate) are heard
+                if (bt.kind == Ventricular && b.heartRate > 0f && 60f / bt.per > b.heartRate * 1.1f)
+                {
+                    if (rT < pulseNext - 0.5 * bt.per) continue;
+                    pulseNext = Math.Max(pulseNext + 60.0 / b.heartRate, rT);
+                }
+                else pulseNext = rT + 60.0 / Math.Max(b.heartRate, 20f);
                 if (now - rT < 0.25 && strength > 0.2f) Thump(b, strength);   // vanilla also thumps at any rate
             }
         }
@@ -468,10 +616,10 @@ namespace EcgPlus
         {
             lastBody = b;
             beats.Clear();
-            buriedP.Clear();
+            buriedP.Clear(); blockedP.Clear();
             nextT = now;
             nextKind = Normal;
-            runLeft = 0;
+            runLeft = 0; capturing = false;
             lastNow = now;
             arrestStart = -1;
             lastR = -1;
@@ -514,9 +662,17 @@ namespace EcgPlus
                 // flutter degrading toward VF: beat-to-beat size varies more and more (+-0 at 80 .. +-30% at 95),
                 // ramped across the cycle so the seams stay continuous
                 // 95-100: the flutter itself breaks up (+-30% -> +-80%) while VF blends in
-                float irr = Mathf.InverseLerp(80f, 95f, f), brk = Smooth(95f, 100f, f);
+                // VT is never machine-exact: from 50 every beat varies a little in size, width, T depth and skew
+                // (+-8% size, more as flutter degrades: +-30% at 95), and flutter's amplitude waxes and wanes
+                float vt = Smooth(45f, 52f, f), irr = Mathf.InverseLerp(80f, 95f, f), brk = Smooth(95f, 100f, f);
+                beat.fuse = Fuse(vtRR, f);
+                lastFuse = beat.fuse;
+                beat.wK = 1f + 0.08f * vt * U();
+                beat.tK = 1f + 0.15f * vt * U();
+                beat.warp = (0.15f * vt + 0.15f * irr) * U();
+                float wax = 1f + 0.12f * SineWeight(f) * Mathf.Sin((float)(T * 2.0 * Math.PI / 3.1)) * Mathf.Sin((float)(T * 2.0 * Math.PI / 7.3) + 1f);
                 beat.amp0 = lastAmp;
-                beat.amp1 = Mathf.Max(0.15f, 1f + ((float)rng.NextDouble() * 2f - 1f) * (0.3f * irr + 0.5f * brk));
+                beat.amp1 = Mathf.Max(0.15f, wax * (1f + U() * (0.08f * vt + 0.22f * irr + 0.5f * brk)));
                 lastAmp = beat.amp1;
             }
             else lastAmp = 1f;
@@ -530,24 +686,49 @@ namespace EcgPlus
             double r = rng.NextDouble();
             if (kind == Normal)
             {
+                if (capturing)
+                {
+                    // capture beat inside VT: the sinus node keeps its slow clock, and the VT focus, reset by
+                    // the capture, fires again about one VT cycle later
+                    capturing = false;
+                    sinusNext = T + sinusRR;
+                    SetVtRate(hr, f); curRun = ++runCounter; curSus = true; nextKind = Ventricular;
+                    nextT = T + beat.pr + vtRR * 0.95f;
+                    return;
+                }
                 sinusNext = T + rr;   // the sinus node keeps its own clock through ectopy
                 sinusRR = rr;
-                if (r < pSus) { SetVtRate(hr); curRun = ++runCounter; curSus = true; nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
-                else if (r < pSus + pRun) { SetVtRate(hr); curRun = ++runCounter; curSus = false; runLeft = RunExtraBeats(f); nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
+                if (r < pSus) { SetVtRate(hr, f); curRun = ++runCounter; curSus = true; nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
+                else if (r < pSus + pRun) { SetVtRate(hr, f); curRun = ++runCounter; curSus = false; runLeft = RunExtraBeats(f); nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
                 else if (r < pSus + pRun + pPvc) { runLeft = 0; curRun = ++runCounter; curSus = false; nextKind = Ventricular; nextT = T + beat.pr + rr * 0.55f; }
                 else { nextKind = Normal; nextT = sinusNext; }
             }
             else
             {
-                float jit = 1f + ((float)rng.NextDouble() * 2f - 1f) * (0.1f * Mathf.InverseLerp(80f, 95f, f) + 0.3f * Smooth(95f, 100f, f));   // +-10% at 95, +-40% at 100
-                if (runLeft > 0) { runLeft--; SetVtRate(hr); nextKind = Ventricular; nextT = T + vtRR * jit; }
-                else if (r < pSus) { SetVtRate(hr); curSus = true; nextKind = Ventricular; nextT = T + vtRR * jit; }
+                // +-4% in VT (monomorphic VT is near regular, not exact), +-10% at 95, +-40% at 100
+                float jit = 1f + U() * (0.04f * Smooth(45f, 52f, f) + 0.06f * Mathf.InverseLerp(80f, 95f, f) + 0.3f * Smooth(95f, 100f, f));
+                // capture beat: a sinus P that lands after this VT beat's refractory period (~60% of the VT cycle)
+                // and early enough that its conducted QRS beats the next VT beat can get through (1 in 4 of
+                // those chances, fading out by flutter). It always comes early, never as a pause.
+                double nextV = T + vtRR * jit, capQrs = sinusNext + 0.16;
+                bool canCap = curSus && runLeft == 0 && capQrs >= T + 0.6 * vtRR && capQrs < nextV - 0.03;
+                if (canCap && rng.NextDouble() < 0.25 * (1f - Smooth(62f, 72f, f)))
+                {
+                    capturing = true;
+                    nextKind = Normal; nextT = sinusNext;
+                    var lastC = beats[beats.Count - 1];
+                    lastC.tail = true;
+                    beats[beats.Count - 1] = lastC;
+                    return;
+                }
+                if (runLeft > 0) { runLeft--; SetVtRate(hr, f); nextKind = Ventricular; nextT = nextV; }
+                else if (r < pSus) { SetVtRate(hr, f); curSus = true; nextKind = Ventricular; nextT = nextV; }
                 else
                 {
                     // first sinus P whose QRS falls outside the ventricular refractory period conducts;
                     // the ones before it are blocked -> compensatory pause (each blocked P still shows, buried in the T)
                     double sn = sinusNext;
-                    while (sn + 0.16 < T + 0.42) { AddBuriedP(sn, f); sn += rr; }
+                    while (sn + 0.16 < T + 0.42) { AddBuriedP(sn, f, true); sn += sinusRR; }
                     nextKind = Normal; nextT = sn;
                     var lastV = beats[beats.Count - 1];
                     lastV.tail = true;
@@ -557,8 +738,12 @@ namespace EcgPlus
                 // otherwise the triangle/sine wave gets a gap or a double-up at every seam
                 if (nextKind == Ventricular)
                 {
-                    // AV dissociation during a run: the sinus node keeps its own (slower) rate
-                    while (sinusNext < nextT) { AddBuriedP(sinusNext, f); sinusNext += sinusRR; }
+                    // AV dissociation during a run: the sinus node keeps its own (slower) rate. In sustained VT the
+                    // game's heart rate carries the +fib boost, so the sinus node runs at roughly HR - fib
+                    // (55 bpm floor, at most 3/4 of the VT rate): P waves march through the QRS/ST/T instead of
+                    // sitting at a fixed spot in front of every complex
+                    if (curSus) sinusRR = 60f / Mathf.Min(Mathf.Max(hr - f, 55f), 0.75f * hr);
+                    while (sinusNext < nextT) { AddBuriedP(sinusNext, f, !curSus); sinusNext += sinusRR; }
                     var last = beats[beats.Count - 1];
                     last.per = (float)(nextT - T);
                     beats[beats.Count - 1] = last;
@@ -566,9 +751,17 @@ namespace EcgPlus
             }
         }
 
-        static void AddBuriedP(double t0, float f)
+        static void AddBuriedP(double t0, float f, bool anchor)
         {
-            float amp = 0.12f * (1f - TriWeight(f));   // lost in the fused triangle / flutter wave
+            // the sinus node keeps firing under ectopic beats: remember the blocked Ps (even when too small to
+            // draw) so the sync view's vanilla trace can follow the sinus clock (not in sustained VT, where the
+            // vanilla clock = the game HR = our VT rate, so it follows the VT beats instead)
+            if (anchor)
+            {
+                blockedP.Add(t0);
+                if (blockedP.Count > 16) blockedP.RemoveAt(0);
+            }
+            float amp = 0.12f * (1f - Fuse(vtRR, f));   // AV dissociation notches; lost once the complexes fuse
             if (amp <= 0.01f) return;
             buriedP.Add(new PWave { t0 = t0, amp = amp });
             if (buriedP.Count > 8) buriedP.RemoveAt(0);
@@ -584,19 +777,42 @@ namespace EcgPlus
             return Mathf.Max(1, Mathf.RoundToInt(mean * (0.5f + (float)rng.NextDouble())));
         }
 
-        static void SetVtRate(float hr) { vtRR = 60f / Mathf.Max(hr, 20f); }   // exactly the game HR (>=20 outside arrest)
+        static float U() => (float)rng.NextDouble() * 2f - 1f;
+        static bool capturing;
+        static void SetVtRate(float hr, float f) { vtRR = 60f / Mathf.Max(ElectricalVtRate(hr, f), 20f); }
+
+        // Electrical (ECG) rate of the ventricles. In VT it is the game's heart rate. From flutter on, the
+        // ventricles fire at 260-300/min while the game's heart rate stands for the perfusing pulse: most of
+        // those contractions eject nothing (pulse deficit). Past ~93 the game's own rate catches up.
+        internal static float ElectricalVtRate(float hr, float f)
+        {
+            float flutter = Mathf.Lerp(260f, 300f, Mathf.InverseLerp(77f, 93f, f));
+            return Mathf.Max(hr, Mathf.Lerp(hr, flutter, SineWeight(f)));
+        }
+
+        // what a monitor counts from the ECG: -1 = not countable (VF / arrest / dead)
+        internal static float EcgRate(Body b)
+        {
+            if (!b.alive || b.inCardiacArrest || VfWeight(b.fibrillationProgress) >= 0.5f) return -1f;
+            if (beats.Count > 0 && beats[beats.Count - 1].kind == Ventricular && beats[beats.Count - 1].sus) return 60f / vtRR;
+            return b.heartRate;
+        }
+
+        static double pulseNext;   // exactly the game HR (>=20 outside arrest)
 
         static float Wave(Beat bt, float s, Body b)
         {
             if (s < 0f) return 0f;
             if (bt.kind == Ventricular)
             {
-                float tmpl = Pvc(s);
-                if (bt.fib <= 36f) return tmpl;
-                // ventricular complexes fuse into a triangle wave (36-65, faint at 40), then round off into flutter's sine (71-77, flutter from 75).
+                float tmpl = Pvc(s, bt);
+                // Ventricular complexes fuse into one periodic wave only when there is no room left between them:
+                // driven by the cycle length (from ~170 bpm, fully fused ~250), and by flutter (71-77, sine from 75).
                 // Phase-aligned with the template (R peak at PvcR) so blending doesn't cancel amplitude.
                 float x = s / bt.per;
-                float sn = x < 1f ? Mathf.Sin(2f * Mathf.PI * (x + 0.25f - PvcR / bt.per)) : 0f;
+                // per-beat skew: warp the phase (fixed at 0 and 1, so seams stay continuous)
+                float xw = x < 1f ? x + bt.warp * Mathf.Sin(2f * Mathf.PI * x) / (2f * Mathf.PI) : x;
+                float sn = x < 1f ? Mathf.Sin(2f * Mathf.PI * (xw + 0.25f - PvcR / bt.per)) : 0f;
                 // the wave climbs again after its trough to meet the next ventricular complex; on the last one of a
                 // run (or a lone PVC) ease from the trough back to baseline instead
                 float xTrough = 0.5f + PvcR / bt.per;
@@ -604,7 +820,7 @@ namespace EcgPlus
                 float tri = x < 1f ? Mathf.Asin(sn) * (2f / Mathf.PI) : 0f;
                 float periodic = 0.9f * Mathf.Lerp(tri, sn, Smooth(71f, 77f, bt.fib));
                 float ampV = Mathf.Lerp(bt.amp0, bt.amp1, Mathf.Clamp01(x));
-                return Mathf.Lerp(tmpl, periodic, Mathf.Pow(Mathf.Clamp01((bt.fib - 36f) / 29f), 0.8f)) * ampV;
+                return Mathf.Lerp(tmpl * bt.amp1, periodic * ampV, bt.fuse);
             }
             float pr = bt.pr, qrs = bt.qrs, qt = bt.qt;
             if (s > pr + qt + 0.1f) return 0f;
@@ -634,13 +850,20 @@ namespace EcgPlus
         // into a deep discordant T - no separate S wave and no return to baseline in between (ST and T merge).
         // The inverted T is asymmetric like a real secondary T inversion: slow downslope, fast return.
         internal const float PvcR = 0.075f, PvcT = 0.34f;
-        static float Pvc(float s)
+        static float Pvc(float s, Beat bt)
         {
             if (s <= 0f || s > 0.62f) return 0f;
-            float r = 1.25f * AG(s, PvcR, 0.048f, 0.04f);   // peak ~1.15 after the T overlap: taller than sinus R (~1.0)   // blunt upstroke: slow muscle-to-muscle conduction
-            float t = 0.58f * AG(s, PvcT, 0.14f, 0.045f);
+            float w = bt.wK > 0f ? bt.wK : 1f, td = bt.tK > 0f ? bt.tK : 1f;
+            // repolarization shortens with rate: in a fast run the discordant T moves in toward the QRS
+            float k = TScale(bt);
+            float r = 1.25f * AG(s, PvcR, 0.048f * w, 0.04f * w);   // peak ~1.15 after the T overlap: taller than sinus R (~1.0)   // blunt upstroke: slow muscle-to-muscle conduction
+            float t = 0.58f * td * AG(s, TPos(bt), 0.14f * k, 0.045f * k);
             return (r - t) * Smooth(0f, 0.05f, s);   // slurred start from baseline
         }
+
+        // T scale/position of a ventricular complex: full size for a lone PVC, compressed in a fast run
+        static float TScale(Beat bt) => bt.per > 0f && !bt.tail ? Mathf.Clamp(bt.per / 0.62f, 0.55f, 1f) : 1f;
+        internal static float TPos(Beat bt) => PvcR + (PvcT - PvcR) * TScale(bt);
 
         static float AG(float x, float mu, float left, float right) => G(x, mu, x < mu ? left : right);
 
@@ -669,7 +892,10 @@ namespace EcgPlus
         }
 
         // ---- info for the big view's annotations ----
-        internal static float TriWeight(float fib) => Mathf.Pow(Mathf.Clamp01((fib - 36f) / 29f), 0.8f);
+        // how fused the ventricular complexes are at cycle length rr (s) and fibrillation f
+        internal static float Fuse(float rr, float f) => Mathf.Max(Smooth(0.36f, 0.24f, rr), SineWeight(f));
+        internal static float FuseNow => lastFuse;
+        static float lastFuse;
         internal static float SineWeight(float fib) => Smooth(71f, 77f, fib);
         internal static float VfWeight(float fib) => Smooth(95f, 100f, fib);
         // 1 = coarse VF right after the arrest began .. 0 = fine VF (brain lost since the arrest)
@@ -694,7 +920,7 @@ namespace EcgPlus
             else
             {
                 o.Add(("R", PvcR, false));
-                if (TriWeight(bt.fib) < 0.5f) o.Add(("T", PvcT, true));   // inverted, merged with ST
+                if (bt.fuse < 0.5f) o.Add(("T", TPos(bt), true));   // inverted, merged with ST
             }
         }
 
